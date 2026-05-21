@@ -1,0 +1,2905 @@
+#!/usr/bin/env python3
+import argparse
+import concurrent.futures
+import datetime as dt
+import html
+import ipaddress
+import json
+import os
+import socket
+import subprocess
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
+
+
+DATA_DIR = os.environ.get("PVE_PORTFW_DIR", "/etc/pve-portfw")
+VMS_FILE = os.path.join(DATA_DIR, "vms.tsv")
+RULES_FILE = os.path.join(DATA_DIR, "rules.tsv")
+EXT_IF = os.environ.get("PVE_PORTFW_EXT_IF", "vmbr0")
+INT_IF = os.environ.get("PVE_PORTFW_INT_IF", "vmbr1")
+NAT_CIDR = os.environ.get("PVE_PORTFW_NAT_CIDR", "10.10.10.0/24")
+DNAT_CHAIN = os.environ.get("PVE_PORTFW_DNAT_CHAIN", "PVEPORTFW_DNAT")
+FWD_CHAIN = os.environ.get("PVE_PORTFW_FWD_CHAIN", "PVEPORTFW_FWD")
+SCAN_CACHE_SECONDS = int(os.environ.get("PVE_PORTFW_SCAN_CACHE_SECONDS", "15"))
+SCAN_WORKERS = int(os.environ.get("PVE_PORTFW_SCAN_WORKERS", "64"))
+WEB_PROBE_ON_REQUEST = os.environ.get("PVE_PORTFW_WEB_PROBE_ON_REQUEST", "0") == "1"
+VM_PORT_TIMEOUT = float(os.environ.get("PVE_PORTFW_WEB_PORT_TIMEOUT", "0.35"))
+CONFIG_CACHE_SECONDS = float(os.environ.get("PVE_PORTFW_WEB_CONFIG_CACHE_SECONDS", "10"))
+STATUS_REFRESH_SECONDS = float(os.environ.get("PVE_PORTFW_WEB_STATUS_REFRESH_SECONDS", "5"))
+STATIC_DIR = os.environ.get("PVE_PORTFW_WEB_STATIC_DIR", "/usr/local/share/pve-portfw-web")
+
+_SCAN_LOCK = threading.Lock()
+_LAST_SCAN_AT = 0.0
+_CONFIG_LOCK = threading.Lock()
+_CONFIG_CACHE = {}
+_STATUS_LOCK = threading.Lock()
+_STATUS_CACHE = None
+_STATUS_ERROR = ""
+
+
+def run(cmd, timeout=5):
+    try:
+        result = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        return {
+            "ok": result.returncode == 0,
+            "code": result.returncode,
+            "stdout": result.stdout.strip(),
+            "stderr": result.stderr.strip(),
+        }
+    except Exception as exc:
+        return {"ok": False, "code": -1, "stdout": "", "stderr": str(exc)}
+
+
+def read_tsv(path, columns):
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.rstrip("\n")
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("\t")
+                parts.extend([""] * (len(columns) - len(parts)))
+                rows.append(dict(zip(columns, parts[: len(columns)])))
+    except FileNotFoundError:
+        pass
+    return rows
+
+
+def qm_list():
+    result = run(["qm", "list"])
+    rows = {}
+    if not result["ok"]:
+        return rows, result
+    for line in result["stdout"].splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        vmid, name, status, mem, bootdisk = parts[:5]
+        pid = parts[5] if len(parts) > 5 else ""
+        rows[vmid] = {
+            "type": "vm",
+            "vmid": vmid,
+            "name": name,
+            "status": status,
+            "mem_mb": mem,
+            "bootdisk_gb": bootdisk,
+            "pid": pid,
+        }
+    for vmid, row in rows.items():
+        bridges = guest_bridges("vm", vmid)
+        row["bridges"] = bridges
+        row["network"] = network_label(bridges)
+    return rows, result
+
+
+def pct_list():
+    result = run(["pct", "list"])
+    rows = {}
+    if not result["ok"]:
+        return rows, result
+    for line in result["stdout"].splitlines()[1:]:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        vmid = parts[0]
+        status = parts[1]
+        name = parts[-1] if len(parts) >= 3 else f"ct-{vmid}"
+        rows[vmid] = {
+            "type": "ct",
+            "vmid": vmid,
+            "name": name,
+            "status": status,
+            "mem_mb": "",
+            "bootdisk_gb": "",
+            "pid": "",
+        }
+    for vmid, row in rows.items():
+        bridges = guest_bridges("ct", vmid)
+        row["bridges"] = bridges
+        row["network"] = network_label(bridges)
+    return rows, result
+
+
+def guest_config(kind, vmid):
+    command = "pct" if kind == "ct" else "qm"
+    key = (command, str(vmid))
+    now = time.monotonic()
+    with _CONFIG_LOCK:
+        cached = _CONFIG_CACHE.get(key)
+        if cached and now - cached["time"] < CONFIG_CACHE_SECONDS:
+            return cached["result"]
+
+    result = run([command, "config", str(vmid)])
+    with _CONFIG_LOCK:
+        _CONFIG_CACHE[key] = {"time": now, "result": result}
+    return result
+
+
+def guest_bridges(kind, vmid):
+    result = guest_config(kind, vmid)
+    bridges = []
+    if not result["ok"]:
+        return bridges
+    for line in result["stdout"].splitlines():
+        if not line.startswith("net"):
+            continue
+        _, _, config = line.partition(":")
+        for part in config.split(","):
+            part = part.strip()
+            if part.startswith("bridge="):
+                bridge = part.split("=", 1)[1]
+                if bridge not in bridges:
+                    bridges.append(bridge)
+    return bridges
+
+
+def network_label(bridges):
+    if INT_IF in bridges:
+        return f"{','.join(bridges)} NAT"
+    if EXT_IF in bridges:
+        return f"{','.join(bridges)} ブリッジ"
+    if bridges:
+        return ",".join(bridges)
+    return "なし"
+
+
+def probe_nat_network():
+    global _LAST_SCAN_AT
+    with _SCAN_LOCK:
+        now = time.monotonic()
+        if now - _LAST_SCAN_AT < SCAN_CACHE_SECONDS:
+            return
+        _LAST_SCAN_AT = now
+
+    gateway = first_ip_from_brief(run(["ip", "-br", "-4", "addr", "show", INT_IF])["stdout"]).split("/")[0]
+    try:
+        network = ipaddress.ip_network(NAT_CIDR, strict=False)
+    except Exception:
+        return
+
+    targets = [str(ip) for ip in network.hosts() if str(ip) != gateway]
+
+    def ping_one(ip_text):
+        subprocess.run(
+            ["ping", "-n", "-c", "1", "-W", "1", ip_text],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=2,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+        list(pool.map(ping_one, targets))
+
+
+def detected_ips_by_mac():
+    result = run(["ip", "neigh", "show", "dev", INT_IF])
+    mapping = {}
+    if not result["ok"]:
+        return mapping
+    for line in result["stdout"].splitlines():
+        parts = line.split()
+        if not parts or "." not in parts[0] or "lladdr" not in parts:
+            continue
+        idx = parts.index("lladdr")
+        if idx + 1 >= len(parts):
+            continue
+        ip = parts[0]
+        mac = parts[idx + 1].lower()
+        mapping.setdefault(mac, set()).add(ip)
+    return mapping
+
+
+def guest_macs(kind, vmid):
+    result = guest_config(kind, vmid)
+    macs = []
+    if not result["ok"]:
+        return macs
+    import re
+
+    for mac in re.findall(r"[0-9A-Fa-f]{2}(?::[0-9A-Fa-f]{2}){5}", result["stdout"]):
+        lowered = mac.lower()
+        if lowered not in macs:
+            macs.append(lowered)
+    return macs
+
+
+def sort_ips(values):
+    def key(value):
+        try:
+            return (0, ipaddress.ip_address(value))
+        except Exception:
+            return (1, value)
+
+    return sorted(values, key=key)
+
+
+def numeric_id_key(row):
+    value = row.get("vmid") or row.get("id") or "0"
+    try:
+        return (0, int(value))
+    except Exception:
+        return (1, str(value))
+
+
+def detected_ips_for_row(row, mac_to_ips):
+    detected = set()
+    for mac in guest_macs(row["type"], row["vmid"]):
+        detected.update(mac_to_ips.get(mac, set()))
+    return sort_ips(detected)
+
+
+def ip_check_state(registered_ip, detected_ips, exists):
+    if not exists:
+        return "missing", False, False
+    if registered_ip and registered_ip in detected_ips:
+        return "ok", True, False
+    if registered_ip and detected_ips:
+        return "mismatch", False, False
+    if registered_ip:
+        return "no-ip", False, True
+    if detected_ips:
+        return "detected", False, True
+    return "unregistered", False, True
+
+
+def first_ip_from_brief(output):
+    parts = output.split()
+    for item in parts:
+        if "/" in item and not item.startswith("fe80:"):
+            return item
+    return ""
+
+
+def iptables_chain(table, chain):
+    cmd = ["iptables", "-t", table, "-S", chain] if table else ["iptables", "-S", chain]
+    result = run(cmd)
+    if result["ok"]:
+        return result["stdout"].splitlines()
+    return []
+
+
+def parse_port_from_local_address(value):
+    if not value or ":" not in value:
+        return ""
+    port = value.rsplit(":", 1)[1]
+    return port if port.isdigit() else ""
+
+
+def host_from_local_address(value, port):
+    if not value:
+        return ""
+    if value.startswith("[") and f"]:{port}" in value:
+        return value[1 : value.rfind("]:")]
+    suffix = f":{port}"
+    if value.endswith(suffix):
+        return value[: -len(suffix)]
+    return ""
+
+
+def local_address_conflicts(local_addr, port, ext_ip):
+    host = host_from_local_address(local_addr, port)
+    return host in {"*", "0.0.0.0", "::"} or bool(ext_ip and host == ext_ip)
+
+
+def listening_port_rows(ext_ip):
+    rows = []
+    for proto, cmd in (
+        ("tcp", ["ss", "-H", "-lntp"]),
+        ("udp", ["ss", "-H", "-lnup"]),
+    ):
+        result = run(cmd)
+        if not result["ok"]:
+            continue
+        for line in result["stdout"].splitlines():
+            parts = line.split(None, 5)
+            if len(parts) < 4:
+                continue
+            local_addr = parts[3]
+            port = parse_port_from_local_address(local_addr)
+            if not port:
+                continue
+            if not local_address_conflicts(local_addr, port, ext_ip):
+                continue
+            detail = line
+            rows.append(
+                {
+                    "proto": proto,
+                    "port": port,
+                    "source": "Proxmoxサービス",
+                    "detail": detail,
+                }
+            )
+    return rows
+
+
+def unmanaged_dnat_port_rows(lines):
+    rows = []
+    for line in lines:
+        parts = line.split()
+        proto = "-"
+        port = ""
+        for index, part in enumerate(parts[:-1]):
+            if part == "-p":
+                proto = parts[index + 1]
+            elif part == "--dport":
+                port = parts[index + 1]
+        if not port:
+            continue
+        rows.append(
+            {
+                "proto": proto,
+                "port": port,
+                "source": "管理外DNAT",
+                "detail": line,
+            }
+        )
+    return rows
+
+
+def sort_port_rows(rows):
+    def key(row):
+        try:
+            port = int(row["port"])
+        except Exception:
+            port = 999999
+        return (port, row.get("proto", ""), row.get("source", ""))
+
+    return sorted(rows, key=key)
+
+
+def tcp_port_open(ip, port, timeout=VM_PORT_TIMEOUT):
+    try:
+        with socket.create_connection((ip, int(port)), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+def vm_port_check(proto, ip, port):
+    if proto != "tcp":
+        return {
+            "status": "unchecked",
+            "ok": False,
+            "warn": True,
+            "label": "未確認",
+            "detail": "UDPは接続確認しません",
+        }
+    if tcp_port_open(ip, port):
+        return {
+            "status": "open",
+            "ok": True,
+            "warn": False,
+            "label": "待受あり",
+            "detail": f"{ip}:{port} に接続できました",
+        }
+    return {
+        "status": "closed",
+        "ok": False,
+        "warn": True,
+        "label": "待受なし",
+        "detail": f"{ip}:{port} に接続できません",
+    }
+
+
+def build_status():
+    vms = read_tsv(VMS_FILE, ["vmid", "name", "nat_ip"])
+    rules = read_tsv(
+        RULES_FILE,
+        ["id", "vmid", "name", "proto", "external_port", "vm_ip", "vm_port", "comment"],
+    )
+    qm_rows, qm_result = qm_list()
+    ct_rows, pct_result = pct_list()
+    guest_rows = {**qm_rows, **ct_rows}
+    registered_by_vmid = {row["vmid"]: row for row in vms}
+    registered_ips = {row["nat_ip"] for row in vms if row.get("nat_ip")}
+    if WEB_PROBE_ON_REQUEST:
+        probe_nat_network()
+    mac_to_ips = detected_ips_by_mac()
+    detected_ip_set = set().union(*mac_to_ips.values()) if mac_to_ips else set()
+    occupied_ips = registered_ips | detected_ip_set
+
+    vm_rows = []
+    for row in vms:
+        q = guest_rows.get(row["vmid"])
+        detected_ips = detected_ips_for_row(q, mac_to_ips) if q else []
+        ip_state, ip_ok, ip_warn = ip_check_state(row.get("nat_ip", ""), detected_ips, q is not None)
+        vm_rows.append(
+            {
+                **row,
+                "type": q["type"] if q else "missing",
+                "registered": True,
+                "exists": q is not None,
+                "detected_ip": ", ".join(detected_ips),
+                "ip_check": ip_state,
+                "ip_ok": ip_ok,
+                "ip_warn": ip_warn,
+                "qm_status": q["status"] if q else "missing",
+                "network": q["network"] if q else "不明",
+                "mem_mb": q["mem_mb"] if q else "",
+                "bootdisk_gb": q["bootdisk_gb"] if q else "",
+            }
+        )
+
+    for vmid, q in sorted(guest_rows.items(), key=lambda item: int(item[0])):
+        if vmid in registered_by_vmid:
+            continue
+        detected_ips = detected_ips_for_row(q, mac_to_ips)
+        ip_state, ip_ok, ip_warn = ip_check_state("", detected_ips, True)
+        vm_rows.append(
+            {
+                "type": q["type"],
+                "vmid": vmid,
+                "name": q["name"],
+                "nat_ip": "",
+                "registered": False,
+                "exists": True,
+                "detected_ip": ", ".join(detected_ips),
+                "ip_check": ip_state,
+                "ip_ok": ip_ok,
+                "ip_warn": ip_warn,
+                "qm_status": q["status"],
+                "network": q["network"],
+                "mem_mb": q["mem_mb"],
+                "bootdisk_gb": q["bootdisk_gb"],
+            }
+        )
+
+    dnat_lines = iptables_chain("nat", DNAT_CHAIN)
+    fwd_lines = iptables_chain("", FWD_CHAIN)
+    rule_rows = []
+    for row in rules:
+        dest = f"{row['vm_ip']}:{row['vm_port']}"
+        needle = f"--dport {row['external_port']} -j DNAT --to-destination {dest}"
+        active = any(needle in line for line in dnat_lines)
+        q = guest_rows.get(row["vmid"])
+        port_check = vm_port_check(row["proto"], row["vm_ip"], row["vm_port"])
+        rule_rows.append(
+            {
+                **row,
+                "out": f"{EXT_IF}:{row['external_port']}",
+                "dest": dest,
+                "vm_port_check": port_check["status"],
+                "vm_port_ok": port_check["ok"],
+                "vm_port_warn": port_check["warn"],
+                "vm_port_label": port_check["label"],
+                "vm_port_detail": port_check["detail"],
+                "vm_exists": q is not None,
+                "type": q["type"] if q else "missing",
+                "qm_status": q["status"] if q else "missing",
+                "active": active,
+            }
+        )
+    vm_rows.sort(key=numeric_id_key)
+    rule_rows.sort(key=numeric_id_key)
+
+    available_ips = []
+    try:
+        network = ipaddress.ip_network(NAT_CIDR, strict=False)
+        hosts = list(network.hosts())
+        start = ipaddress.ip_address("10.10.10.10")
+        for ip in hosts:
+            if ip == ipaddress.ip_address("10.10.10.1"):
+                continue
+            if ip.version == 4 and ip < start and str(network.network_address) == "10.10.10.0":
+                continue
+            ip_text = str(ip)
+            if ip_text not in occupied_ips:
+                available_ips.append(ip_text)
+            if len(available_ips) >= 20:
+                break
+    except Exception:
+        pass
+
+    vmbr0 = run(["ip", "-br", "addr", "show", EXT_IF])
+    vmbr1 = run(["ip", "-br", "addr", "show", INT_IF])
+    ip_forward = run(["sysctl", "-n", "net.ipv4.ip_forward"])
+    masq = run(["iptables", "-t", "nat", "-C", "POSTROUTING", "-s", NAT_CIDR, "-o", EXT_IF, "-j", "MASQUERADE"])
+    service = run(["systemctl", "is-active", "pve-portfw.service"])
+    web_service = run(["systemctl", "is-active", "pve-portfw-web.service"])
+    dnat_exists = run(["iptables", "-t", "nat", "-L", DNAT_CHAIN, "-n"])
+    fwd_exists = run(["iptables", "-L", FWD_CHAIN, "-n"])
+    unmanaged = run(["bash", "-lc", f"iptables -t nat -S PREROUTING | grep DNAT | grep -v {DNAT_CHAIN!r} || true"])
+    unmanaged_lines = unmanaged["stdout"].splitlines() if unmanaged["stdout"] else []
+
+    port_rows = []
+    for row in rules:
+        port_rows.append(
+            {
+                "proto": row["proto"],
+                "port": row["external_port"],
+                "source": "pve-portfw",
+                "detail": f"{EXT_IF}:{row['external_port']} -> {row['vm_ip']}:{row['vm_port']} ({row['name']})",
+            }
+        )
+    ext_ip = first_ip_from_brief(vmbr0["stdout"]).split("/")[0]
+    port_rows.extend(listening_port_rows(ext_ip))
+    port_rows.extend(unmanaged_dnat_port_rows(unmanaged_lines))
+    port_rows = sort_port_rows(port_rows)
+    used_external_ports = sorted(
+        {row["port"] for row in port_rows if str(row.get("port", "")).isdigit()},
+        key=lambda value: int(value),
+    )
+
+    return {
+        "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "config": {
+            "data_dir": DATA_DIR,
+            "external_interface": EXT_IF,
+            "internal_interface": INT_IF,
+            "nat_cidr": NAT_CIDR,
+            "dnat_chain": DNAT_CHAIN,
+            "forward_chain": FWD_CHAIN,
+        },
+        "vm_rows": vm_rows,
+        "rule_rows": rule_rows,
+        "port_rows": port_rows,
+        "used_external_ports": used_external_ports,
+        "registered_ips": sort_ips(registered_ips),
+        "detected_ips": sort_ips(detected_ip_set),
+        "used_ips": sort_ips(occupied_ips),
+        "available_ips": available_ips,
+        "diagnostics": {
+            "qm_list_ok": qm_result["ok"],
+            "pct_list_ok": pct_result["ok"],
+            "vmbr0": vmbr0["stdout"],
+            "vmbr1": vmbr1["stdout"],
+            "vmbr0_ip": first_ip_from_brief(vmbr0["stdout"]),
+            "vmbr1_ip": first_ip_from_brief(vmbr1["stdout"]),
+            "ip_forward": ip_forward["stdout"],
+            "masquerade_ok": masq["ok"],
+            "pve_portfw_service": service["stdout"],
+            "pve_portfw_web_service": web_service["stdout"],
+            "dnat_chain_ok": dnat_exists["ok"],
+            "forward_chain_ok": fwd_exists["ok"],
+            "dnat_rule_count": len([line for line in dnat_lines if line.startswith("-A ")]),
+            "forward_rule_count": len([line for line in fwd_lines if line.startswith("-A ")]),
+            "unmanaged_dnat": unmanaged_lines,
+        },
+    }
+
+
+def refresh_status_cache():
+    global _STATUS_CACHE, _STATUS_ERROR
+    try:
+        status = build_status()
+    except Exception as exc:
+        with _STATUS_LOCK:
+            _STATUS_ERROR = str(exc)
+        return None
+
+    with _STATUS_LOCK:
+        _STATUS_CACHE = status
+        _STATUS_ERROR = ""
+    return status
+
+
+def cached_status():
+    with _STATUS_LOCK:
+        return _STATUS_CACHE
+
+
+def status_for_response():
+    status = cached_status()
+    if status is not None:
+        return status
+    status = refresh_status_cache()
+    return status if status is not None else build_fast_status()
+
+
+def status_refresher():
+    while True:
+        refresh_status_cache()
+        time.sleep(STATUS_REFRESH_SECONDS)
+
+
+def start_status_refresher():
+    thread = threading.Thread(target=status_refresher, name="status-refresher", daemon=True)
+    thread.start()
+
+
+def esc(value):
+    return html.escape(str(value), quote=True)
+
+
+LABELS = {
+    "ok": "一致",
+    "mismatch": "不一致",
+    "no-ip": "未検出",
+    "detected": "検出済み",
+    "unregistered": "未登録",
+    "registered": "登録済み",
+    "missing": "不明",
+    "active": "有効",
+    "open": "待受あり",
+    "closed": "待受なし",
+    "unchecked": "未確認",
+    "running": "実行中",
+    "stopped": "停止中",
+    "OK": "正常",
+    "CHECK": "確認",
+}
+
+
+def status_pill(label, good, warning=False):
+    cls = "ok" if good else "warn" if warning else "bad"
+    return f'<span class="pill {cls}">{esc(LABELS.get(label, label))}</span>'
+
+
+def type_label(value):
+    return {"vm": "VM", "ct": "CT", "missing": "不明"}.get(value, value)
+
+
+NAV_ITEMS = [
+    ("/", "トップ"),
+    ("/status", "状況"),
+    ("/vmct", "VM/CTとは"),
+    ("/create-vm", "VMの作り方"),
+    ("/create-ct", "CTの作り方"),
+    ("/network", "通信設定"),
+    ("/portfw", "ポート転送"),
+    ("/trouble", "困ったとき"),
+]
+
+
+def nav_html(active_path):
+    links = []
+    for path, label in NAV_ITEMS:
+        active = ' class="active"' if path == active_path else ""
+        links.append(f'<a{active} href="{esc(path)}">{esc(label)}</a>')
+    return "\n    ".join(links)
+
+
+def copy_block(content, label="コピー", extra_class=""):
+    classes = "cmd-block"
+    if extra_class:
+        classes += f" {extra_class}"
+    return f"""<div class="{esc(classes)}">
+            <button class="copy-btn" type="button">{esc(label)}</button>
+            <pre><code>{esc(content.strip())}</code></pre>
+          </div>"""
+
+
+def highlighted_copy_block(content, highlights, label="コピー", extra_class=""):
+    classes = "cmd-block"
+    if extra_class:
+        classes += f" {extra_class}"
+    rendered = esc(content.strip())
+    for item in sorted(set(highlights), key=len, reverse=True):
+        escaped_item = esc(item)
+        rendered = rendered.replace(escaped_item, f'<span class="code-hl">{escaped_item}</span>')
+    return f"""<div class="{esc(classes)}">
+            <button class="copy-btn" type="button">{esc(label)}</button>
+            <pre><code>{rendered}</code></pre>
+          </div>"""
+
+
+def cmd_block(text):
+    commands = []
+    for raw_line in text.strip("\n").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        commands.append(line)
+    return "\n".join(copy_block(command) for command in commands)
+
+
+def highlighted_cmd_block(text, highlights):
+    commands = []
+    for raw_line in text.strip("\n").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        commands.append(line)
+    return "\n".join(highlighted_copy_block(command, highlights) for command in commands)
+
+
+def config_block(text):
+    return copy_block(text, label="設定をコピー", extra_class="config-block")
+
+
+def highlighted_config_block(text, highlights):
+    return highlighted_copy_block(text, highlights, label="設定をコピー", extra_class="config-block")
+
+
+WIZARD_TABS = ["全般", "OS", "システム", "ディスク", "CPU", "メモリ", "ネットワーク", "確認"]
+
+
+def screenshot_figure(filename, caption, folder="vm-create"):
+    version = str(int(time.time()))
+    caption_html = f"<figcaption>{esc(caption)}</figcaption>" if caption else ""
+    alt = caption or filename
+    return f"""<figure class="screenshot-figure">
+            <img src="/static/{esc(folder)}/{esc(filename)}?v={esc(version)}" alt="{esc(alt)}" loading="lazy">
+            {caption_html}
+          </figure>"""
+
+
+def wizard_figure(active_tab, rows):
+    tabs = "".join(
+        f'<span class="{"active" if tab == active_tab else ""}">{esc(tab)}</span>'
+        for tab in WIZARD_TABS
+    )
+    row_html = "".join(
+        f'<div class="wizard-row"><span>{esc(label)}</span><strong>{value}</strong></div>'
+        for label, value in rows
+    )
+    return f"""<figure class="wizard-shot">
+            <div class="wizard-title">作成: 仮想マシン</div>
+            <div class="wizard-tabs">{tabs}</div>
+            <div class="wizard-body">{row_html}</div>
+          </figure>"""
+
+
+def build_help_context():
+    vms = read_tsv(VMS_FILE, ["vmid", "name", "nat_ip"])
+    rules = read_tsv(
+        RULES_FILE,
+        ["id", "vmid", "name", "proto", "external_port", "vm_ip", "vm_port", "comment"],
+    )
+    used_ips = sort_ips({row["nat_ip"] for row in vms if row.get("nat_ip")})
+    used_ports = sorted(
+        {row["external_port"] for row in rules if str(row.get("external_port", "")).isdigit()},
+        key=lambda value: int(value),
+    )
+    return {
+        "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "used_ips": used_ips,
+        "used_external_ports": used_ports,
+    }
+
+
+def build_fast_status():
+    vms = read_tsv(VMS_FILE, ["vmid", "name", "nat_ip"])
+    rules = read_tsv(
+        RULES_FILE,
+        ["id", "vmid", "name", "proto", "external_port", "vm_ip", "vm_port", "comment"],
+    )
+    vm_rows = []
+    for row in vms:
+        vm_rows.append(
+            {
+                **row,
+                "type": "missing",
+                "registered": True,
+                "exists": False,
+                "detected_ip": "",
+                "ip_check": "unchecked",
+                "ip_ok": False,
+                "ip_warn": True,
+                "qm_status": "CHECK",
+                "network": "読み込み中",
+                "mem_mb": "",
+                "bootdisk_gb": "",
+            }
+        )
+
+    rule_rows = []
+    for row in rules:
+        rule_rows.append(
+            {
+                **row,
+                "out": f"{EXT_IF}:{row['external_port']}",
+                "dest": f"{row['vm_ip']}:{row['vm_port']}",
+                "vm_port_check": "unchecked",
+                "vm_port_ok": False,
+                "vm_port_warn": True,
+                "vm_port_label": "未確認",
+                "vm_port_detail": "読み込み中",
+                "vm_exists": False,
+                "type": "missing",
+                "qm_status": "CHECK",
+                "active": False,
+            }
+        )
+
+    used_external_ports = sorted(
+        {row["external_port"] for row in rules if str(row.get("external_port", "")).isdigit()},
+        key=lambda value: int(value),
+    )
+    used_ips = sort_ips({row["nat_ip"] for row in vms if row.get("nat_ip")})
+    return {
+        "generated_at": dt.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "config": {
+            "data_dir": DATA_DIR,
+            "external_interface": EXT_IF,
+            "internal_interface": INT_IF,
+            "nat_cidr": NAT_CIDR,
+            "dnat_chain": DNAT_CHAIN,
+            "forward_chain": FWD_CHAIN,
+        },
+        "vm_rows": sorted(vm_rows, key=numeric_id_key),
+        "rule_rows": sorted(rule_rows, key=numeric_id_key),
+        "port_rows": [],
+        "used_external_ports": used_external_ports,
+        "registered_ips": used_ips,
+        "detected_ips": [],
+        "used_ips": used_ips,
+        "available_ips": [],
+        "diagnostics": {
+            "qm_list_ok": False,
+            "pct_list_ok": False,
+            "vmbr0": "",
+            "vmbr1": "",
+            "vmbr0_ip": "",
+            "vmbr1_ip": "",
+            "ip_forward": "",
+            "masquerade_ok": False,
+            "pve_portfw_service": "",
+            "pve_portfw_web_service": "",
+            "dnat_chain_ok": False,
+            "forward_chain_ok": False,
+            "dnat_rule_count": 0,
+            "forward_rule_count": 0,
+            "unmanaged_dnat": [],
+        },
+    }
+
+
+def render_html(status):
+    diag = status["diagnostics"]
+    vm_rows = status["vm_rows"]
+    rule_rows = status["rule_rows"]
+    registered_count = sum(1 for row in vm_rows if row["registered"])
+    unregistered_count = sum(1 for row in vm_rows if not row["registered"])
+    active_rule_count = sum(1 for row in rule_rows if row["active"])
+
+    vm_body = "\n".join(
+        f"""
+        <tr>
+          <td>{esc(type_label(row['type']))}</td>
+          <td>{esc(row['vmid'])}</td>
+          <td>{esc(row['name'])}</td>
+          <td>{esc(row['nat_ip'] or '-')}</td>
+          <td>{esc(row['detected_ip'] or '-')}</td>
+          <td>{status_pill(row['ip_check'], row['ip_ok'], row['ip_warn'])}</td>
+          <td>{esc(row['network'])}</td>
+          <td>{status_pill('registered' if row['registered'] else 'unregistered', row['registered'])}</td>
+          <td>{status_pill(row['qm_status'], row['exists'] and row['qm_status'] == 'running')}</td>
+          <td>{esc(row['mem_mb'])}</td>
+          <td>{esc(row['bootdisk_gb'])}</td>
+        </tr>
+        """
+        for row in vm_rows
+    ) or '<tr><td colspan="11" class="empty">VM/CTはありません。</td></tr>'
+
+    rules_body = "\n".join(
+        f"""
+        <tr>
+          <td>{esc(row['id'])}</td>
+          <td>{esc(row['proto'])}</td>
+          <td><code>{esc(row['out'])}</code></td>
+          <td><code>{esc(row['dest'])}</code></td>
+          <td>{esc(row['vmid'])}</td>
+          <td>{esc(type_label(row['type']))}</td>
+          <td>{esc(row['name'])}</td>
+          <td>{status_pill('active' if row['active'] else 'missing', row['active'])}</td>
+          <td title="{esc(row['vm_port_detail'])}">{status_pill(row['vm_port_label'], row['vm_port_ok'], row['vm_port_warn'])}</td>
+          <td>{status_pill(row['qm_status'], row['vm_exists'] and row['qm_status'] == 'running')}</td>
+          <td>{esc(row['comment'])}</td>
+        </tr>
+        """
+        for row in rule_rows
+    ) or '<tr><td colspan="11" class="empty">ポート転送ルールはありません。</td></tr>'
+
+    used_ips = "".join(f"<li><code>{esc(ip)}</code></li>" for ip in status["used_ips"]) or '<li class="empty">なし</li>'
+    used_external_ports = "".join(f"<li><code>{esc(port)}</code></li>" for port in status["used_external_ports"]) or '<li class="empty">なし</li>'
+    unmanaged = "".join(f"<li><code>{esc(line)}</code></li>" for line in diag["unmanaged_dnat"]) or '<li class="empty">なし</li>'
+
+    diag_items = [
+        ("VM一覧", "qm list", diag["qm_list_ok"]),
+        ("コンテナ一覧", "pct list", diag["pct_list_ok"]),
+        ("vmbr0", diag["vmbr0"], bool(diag["vmbr0"])),
+        ("vmbr1", diag["vmbr1"], bool(diag["vmbr1"])),
+        ("IP転送", diag["ip_forward"], diag["ip_forward"] == "1"),
+        ("MASQUERADE", f"{NAT_CIDR} -> {EXT_IF}", diag["masquerade_ok"]),
+        ("pve-portfw.service", diag["pve_portfw_service"], diag["pve_portfw_service"] == "active"),
+        ("pve-portfw-web.service", diag["pve_portfw_web_service"], diag["pve_portfw_web_service"] in {"active", "activating"}),
+        ("DNATチェーン", DNAT_CHAIN, diag["dnat_chain_ok"]),
+        ("FORWARDチェーン", FWD_CHAIN, diag["forward_chain_ok"]),
+    ]
+    diag_body = "\n".join(
+        f"""
+        <tr>
+          <td>{esc(name)}</td>
+          <td>{esc(value)}</td>
+          <td>{status_pill('OK' if ok else 'CHECK', ok)}</td>
+        </tr>
+        """
+        for name, value, ok in diag_items
+    )
+
+    return f"""<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pve-portfw 管理ダッシュボード</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --text: #1e2933;
+      --muted: #65758b;
+      --line: #d8e0e8;
+      --accent: #0b6bcb;
+      --ok: #0f7b45;
+      --bad: #b42318;
+      --warn: #9a6700;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+    }}
+    header {{
+      background: #102a43;
+      color: white;
+      padding: 18px 28px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }}
+    header h1 {{
+      margin: 0;
+      font-size: 22px;
+      letter-spacing: 0;
+    }}
+    header .titlebar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; }}
+    header .meta {{ color: #cbd5e1; font-size: 13px; }}
+    nav {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      background: #0b1f33;
+      padding: 0 28px 14px;
+    }}
+    nav a {{
+      color: #dbeafe;
+      text-decoration: none;
+      border: 1px solid rgba(219, 234, 254, .35);
+      border-radius: 6px;
+      padding: 7px 12px;
+      font-size: 14px;
+      font-weight: 700;
+    }}
+    nav a.active {{ color: #102a43; background: #ffffff; border-color: #ffffff; }}
+    main {{ padding: 24px 28px 40px; max-width: 1500px; margin: 0 auto; }}
+    .summary {{
+      display: grid;
+      grid-template-columns: repeat(4, minmax(160px, 1fr));
+      gap: 12px;
+      margin-bottom: 18px;
+    }}
+    .metric, section {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+    }}
+    .metric {{ padding: 14px 16px; }}
+    .metric .label {{ color: var(--muted); font-size: 12px; text-transform: uppercase; }}
+    .metric .value {{ font-size: 26px; font-weight: 700; margin-top: 3px; }}
+    section {{ margin-top: 18px; overflow: hidden; }}
+    section h2 {{
+      margin: 0;
+      padding: 13px 16px;
+      font-size: 16px;
+      background: #eef4fb;
+      border-bottom: 1px solid var(--line);
+    }}
+    table {{ width: 100%; border-collapse: collapse; }}
+    th, td {{
+      text-align: left;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      white-space: nowrap;
+      vertical-align: middle;
+    }}
+    th {{ color: var(--muted); font-size: 12px; background: #fafbfc; }}
+    tr:last-child td {{ border-bottom: 0; }}
+    code {{
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      background: #eef2f7;
+      padding: 2px 5px;
+      border-radius: 4px;
+    }}
+    .pill {{
+      display: inline-block;
+      min-width: 70px;
+      text-align: center;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 12px;
+      font-weight: 700;
+      color: white;
+    }}
+    .pill.ok {{ background: var(--ok); }}
+    .pill.bad {{ background: var(--bad); }}
+    .pill.warn {{ background: var(--warn); }}
+    .list-panel {{ padding: 14px 16px; }}
+    .ip-list {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      padding: 0;
+      margin: 0;
+      list-style: none;
+    }}
+    .empty {{ color: var(--muted); }}
+    .note {{
+      margin: 0;
+      padding: 12px 16px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .help-grid {{ display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 18px; }}
+    .help-section {{ margin-top: 0; }}
+    .help-section .body {{ padding: 14px 16px; }}
+    .help-section ul {{ margin: 0; padding-left: 20px; }}
+    .help-section li {{ margin: 8px 0; }}
+    .help-section pre {{
+      margin: 10px 0 0;
+      padding: 12px;
+      overflow-x: auto;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 6px;
+      line-height: 1.45;
+    }}
+    .callout {{
+      border-left: 4px solid var(--accent);
+      background: #eef6ff;
+      padding: 12px 14px;
+      margin: 0 0 12px;
+      border-radius: 0 6px 6px 0;
+    }}
+    @media (max-width: 900px) {{
+      .summary {{ grid-template-columns: 1fr; }}
+      .help-grid {{ grid-template-columns: 1fr; }}
+      main {{ padding: 18px; }}
+      table {{ display: block; overflow-x: auto; }}
+      header {{ align-items: flex-start; flex-direction: column; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="titlebar">
+      <h1>pve-portfw 管理ダッシュボード</h1>
+      <div class="meta">読み取り専用 / リアルタイム更新 / <span id="live-status">接続中</span> / <span id="generated-at">{esc(status['generated_at'])}</span></div>
+    </div>
+  </header>
+  <nav>
+    {nav_html("/status")}
+  </nav>
+  <main>
+    <div class="summary">
+      <div class="metric"><div class="label">登録済みVM/CT</div><div class="value" id="registered-count">{registered_count}</div></div>
+      <div class="metric"><div class="label">未登録VM/CT</div><div class="value" id="unregistered-count">{unregistered_count}</div></div>
+      <div class="metric"><div class="label">ポート転送ルール</div><div class="value" id="rule-count">{len(rule_rows)}</div></div>
+      <div class="metric"><div class="label">有効なルール</div><div class="value" id="active-rule-count">{active_rule_count}</div></div>
+    </div>
+
+    <section>
+      <h2>VM/CT一覧とNAT IP検出</h2>
+      <table>
+        <thead><tr><th>種別</th><th>ID</th><th>名前</th><th>登録IP</th><th>検出IP</th><th>IP確認</th><th>ネットワーク</th><th>登録状態</th><th>稼働状態</th><th>メモリMB</th><th>ディスクGB</th></tr></thead>
+        <tbody id="vm-body">{vm_body}</tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>ポート転送ルール</h2>
+      <table>
+        <thead><tr><th>ID</th><th>プロトコル</th><th>外側</th><th>転送先</th><th>VM/CT ID</th><th>種別</th><th>名前</th><th>ルール</th><th>VM側ポート</th><th>VM/CT</th><th>メモ</th></tr></thead>
+        <tbody id="rules-body">{rules_body}</tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>使用中の外側ポート</h2>
+      <div class="list-panel"><ul class="ip-list" id="used-external-ports">{used_external_ports}</ul></div>
+    </section>
+
+    <section>
+      <h2>使用中のNAT IP</h2>
+      <div class="list-panel"><ul class="ip-list" id="used-ips">{used_ips}</ul></div>
+    </section>
+
+    <section>
+      <h2>設定チェック</h2>
+      <div class="note">NATとポート転送が動くために必要なProxmox側の状態です。</div>
+      <table>
+        <thead><tr><th>項目</th><th>値</th><th>状態</th></tr></thead>
+        <tbody id="diag-body">{diag_body}</tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>管理外DNAT候補</h2>
+      <div class="note">pve-portfw以外が入れている可能性のあるポート転送ルールです。通常は「なし」で問題ありません。</div>
+      <div class="list-panel"><ul id="unmanaged-dnat">{unmanaged}</ul></div>
+    </section>
+  </main>
+  <script>
+    const labels = {{
+      ok: "一致",
+      mismatch: "不一致",
+      "no-ip": "未検出",
+      detected: "検出済み",
+      unregistered: "未登録",
+      registered: "登録済み",
+      missing: "不明",
+      active: "有効",
+      open: "待受あり",
+      closed: "待受なし",
+      unchecked: "未確認",
+      running: "実行中",
+      stopped: "停止中",
+      OK: "正常",
+      CHECK: "確認"
+    }};
+
+    function esc(value) {{
+      return String(value ?? "").replace(/[&<>"']/g, char => ({{
+        "&": "&amp;",
+        "<": "&lt;",
+        ">": "&gt;",
+        '"': "&quot;",
+        "'": "&#39;"
+      }}[char]));
+    }}
+
+    function typeLabel(value) {{
+      return {{ vm: "VM", ct: "CT", missing: "不明" }}[value] || value || "";
+    }}
+
+    function pill(label, good, warning = false) {{
+      const cls = good ? "ok" : warning ? "warn" : "bad";
+      return `<span class="pill ${{cls}}">${{esc(labels[label] || label)}}</span>`;
+    }}
+
+    function code(value) {{
+      return `<code>${{esc(value)}}</code>`;
+    }}
+
+    function listItems(values) {{
+      if (!values || values.length === 0) return '<li class="empty">なし</li>';
+      return values.map(value => `<li>${{code(value)}}</li>`).join("");
+    }}
+
+    function renderStatus(status) {{
+      const vmRows = status.vm_rows || [];
+      const ruleRows = status.rule_rows || [];
+      document.getElementById("registered-count").textContent = vmRows.filter(row => row.registered).length;
+      document.getElementById("unregistered-count").textContent = vmRows.filter(row => !row.registered).length;
+      document.getElementById("rule-count").textContent = ruleRows.length;
+      document.getElementById("active-rule-count").textContent = ruleRows.filter(row => row.active).length;
+      document.getElementById("generated-at").textContent = status.generated_at || "";
+
+      document.getElementById("vm-body").innerHTML = vmRows.length ? vmRows.map(row => `
+        <tr>
+          <td>${{esc(typeLabel(row.type))}}</td>
+          <td>${{esc(row.vmid)}}</td>
+          <td>${{esc(row.name)}}</td>
+          <td>${{esc(row.nat_ip || "-")}}</td>
+          <td>${{esc(row.detected_ip || "-")}}</td>
+          <td>${{pill(row.ip_check, row.ip_ok, row.ip_warn)}}</td>
+          <td>${{esc(row.network)}}</td>
+          <td>${{pill(row.registered ? "registered" : "unregistered", row.registered)}}</td>
+          <td>${{pill(row.qm_status, row.exists && row.qm_status === "running")}}</td>
+          <td>${{esc(row.mem_mb)}}</td>
+          <td>${{esc(row.bootdisk_gb)}}</td>
+        </tr>
+      `).join("") : '<tr><td colspan="11" class="empty">VM/CTはありません。</td></tr>';
+
+      document.getElementById("rules-body").innerHTML = ruleRows.length ? ruleRows.map(row => `
+        <tr>
+          <td>${{esc(row.id)}}</td>
+          <td>${{esc(row.proto)}}</td>
+          <td>${{code(row.out)}}</td>
+          <td>${{code(row.dest)}}</td>
+          <td>${{esc(row.vmid)}}</td>
+          <td>${{esc(typeLabel(row.type))}}</td>
+          <td>${{esc(row.name)}}</td>
+          <td>${{pill(row.active ? "active" : "missing", row.active)}}</td>
+          <td title="${{esc(row.vm_port_detail)}}">${{pill(row.vm_port_label, row.vm_port_ok, row.vm_port_warn)}}</td>
+          <td>${{pill(row.qm_status, row.vm_exists && row.qm_status === "running")}}</td>
+          <td>${{esc(row.comment)}}</td>
+        </tr>
+      `).join("") : '<tr><td colspan="11" class="empty">ポート転送ルールはありません。</td></tr>';
+
+      document.getElementById("used-external-ports").innerHTML = listItems(status.used_external_ports);
+      document.getElementById("used-ips").innerHTML = listItems(status.used_ips);
+
+      const diag = status.diagnostics || {{}};
+      const cfg = status.config || {{}};
+      const diagItems = [
+        ["VM一覧", "qm list", diag.qm_list_ok],
+        ["コンテナ一覧", "pct list", diag.pct_list_ok],
+        ["vmbr0", diag.vmbr0 || "", Boolean(diag.vmbr0)],
+        ["vmbr1", diag.vmbr1 || "", Boolean(diag.vmbr1)],
+        ["IP転送", diag.ip_forward || "", diag.ip_forward === "1"],
+        ["MASQUERADE", `${{cfg.nat_cidr || ""}} -> ${{cfg.external_interface || ""}}`, diag.masquerade_ok],
+        ["pve-portfw.service", diag.pve_portfw_service || "", diag.pve_portfw_service === "active"],
+        ["pve-portfw-web.service", diag.pve_portfw_web_service || "", ["active", "activating"].includes(diag.pve_portfw_web_service)],
+        ["DNATチェーン", cfg.dnat_chain || "", diag.dnat_chain_ok],
+        ["FORWARDチェーン", cfg.forward_chain || "", diag.forward_chain_ok]
+      ];
+      document.getElementById("diag-body").innerHTML = diagItems.map(([name, value, ok]) => `
+        <tr>
+          <td>${{esc(name)}}</td>
+          <td>${{esc(value)}}</td>
+          <td>${{pill(ok ? "OK" : "CHECK", ok)}}</td>
+        </tr>
+      `).join("");
+
+      const unmanaged = diag.unmanaged_dnat || [];
+      document.getElementById("unmanaged-dnat").innerHTML = unmanaged.length
+        ? unmanaged.map(line => `<li>${{code(line)}}</li>`).join("")
+        : '<li class="empty">なし</li>';
+    }}
+
+    function connectEvents() {{
+      const live = document.getElementById("live-status");
+      if (!window.EventSource) {{
+        live.textContent = "通常更新";
+        setInterval(() => fetch("/api/status").then(res => res.json()).then(renderStatus).catch(() => {{
+          live.textContent = "更新失敗";
+        }}), 5000);
+        return;
+      }}
+      const events = new EventSource("/events");
+      events.onopen = () => {{ live.textContent = "接続中"; }};
+      events.onmessage = event => {{
+        live.textContent = "更新中";
+        renderStatus(JSON.parse(event.data));
+      }};
+      events.onerror = () => {{ live.textContent = "再接続中"; }};
+    }}
+
+    connectEvents();
+  </script>
+</body>
+</html>
+"""
+
+
+def render_help_html(status=None):
+    if status is None:
+        status = build_help_context()
+    used_ips = ", ".join(status["used_ips"]) or "なし"
+    used_ports = ", ".join(status["used_external_ports"]) or "なし"
+    generated_at = status["generated_at"]
+    return f"""<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>pve-portfw 使い方</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --text: #1e2933;
+      --muted: #65758b;
+      --line: #d8e0e8;
+      --accent: #0b6bcb;
+      --warn: #9a6700;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+    }}
+    header {{
+      background: #102a43;
+      color: white;
+      padding: 18px 28px;
+    }}
+    header .titlebar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; }}
+    header h1 {{ margin: 0; font-size: 22px; letter-spacing: 0; }}
+    header .meta {{ color: #cbd5e1; font-size: 13px; }}
+    nav {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      background: #0b1f33;
+      padding: 0 28px 14px;
+    }}
+    nav a {{
+      color: #dbeafe;
+      text-decoration: none;
+      border: 1px solid rgba(219, 234, 254, .35);
+      border-radius: 6px;
+      padding: 7px 12px;
+      font-size: 14px;
+      font-weight: 700;
+    }}
+    nav a.active {{ color: #102a43; background: #ffffff; border-color: #ffffff; }}
+    main {{ padding: 24px 28px 40px; max-width: 1200px; margin: 0 auto; }}
+    .help-grid {{ display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 18px; }}
+    section {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+    }}
+    section.wide {{ grid-column: 1 / -1; }}
+    section h2 {{
+      margin: 0;
+      padding: 13px 16px;
+      font-size: 16px;
+      background: #eef4fb;
+      border-bottom: 1px solid var(--line);
+    }}
+    .body {{ padding: 14px 16px; }}
+    .body ul {{ margin: 0; padding-left: 20px; }}
+    .body li {{ margin: 8px 0; }}
+    .note {{
+      color: var(--muted);
+      margin-top: 8px;
+      line-height: 1.55;
+    }}
+    .callout {{
+      border-left: 4px solid var(--accent);
+      background: #eef6ff;
+      padding: 12px 14px;
+      margin: 0 0 12px;
+      border-radius: 0 6px 6px 0;
+    }}
+    .warn {{
+      border-left-color: var(--warn);
+      background: #fff7e6;
+    }}
+    code {{
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      background: #eef2f7;
+      padding: 2px 5px;
+      border-radius: 4px;
+    }}
+    pre {{
+      margin: 10px 0 0;
+      padding: 12px;
+      overflow-x: auto;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 6px;
+      line-height: 1.45;
+    }}
+    pre code {{ background: transparent; color: inherit; padding: 0; }}
+    .cmd-block {{ position: relative; margin-top: 10px; }}
+    .cmd-block pre {{ margin: 0; padding-right: 76px; }}
+    .copy-btn {{
+      position: absolute;
+      top: 8px;
+      right: 8px;
+      border: 1px solid rgba(226, 232, 240, .45);
+      background: rgba(15, 23, 42, .86);
+      color: #e2e8f0;
+      border-radius: 5px;
+      padding: 4px 9px;
+      font-size: 12px;
+      font-weight: 700;
+      cursor: pointer;
+    }}
+    .copy-btn:hover {{ background: #1e293b; }}
+    @media (max-width: 900px) {{
+      .help-grid {{ grid-template-columns: 1fr; }}
+      main {{ padding: 18px; }}
+      header .titlebar {{ align-items: flex-start; flex-direction: column; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="titlebar">
+      <h1>pve-portfw 使い方</h1>
+      <div class="meta">読み取り専用 / 最終生成 {esc(generated_at)}</div>
+    </div>
+  </header>
+  <nav>
+    <a href="/status">状況</a>
+    <a class="active" href="/help">使い方</a>
+  </nav>
+  <main>
+    <div class="help-grid">
+      <section>
+        <h2>ネットワークの選び方</h2>
+        <div class="body">
+          <div class="callout">新しく VM/CT を作るときは、基本的に <code>{esc(INT_IF)}</code> を選びます。</div>
+          <ul>
+            <li><code>{esc(INT_IF)}</code>: NAT用。通常はこちら。VM/CTは研究室LANに直接出さず、必要な通信だけポート転送します。</li>
+            <li><code>{esc(EXT_IF)}</code>: 研究室LAN直結。固定IPを直接持たせたい特別な用途だけ使います。</li>
+            <li>ポート転送したいときは、PVE上で <code>pve-portfw</code> を実行します。</li>
+          </ul>
+        </div>
+      </section>
+
+      <section>
+        <h2>このサーバのIPルール</h2>
+        <div class="body">
+          <ul>
+            <li>iDRAC: <code>172.28.4.146</code></li>
+            <li>Proxmox管理画面: <code>172.28.4.147:8006</code></li>
+            <li>NAT内ネットワーク: <code>{esc(NAT_CIDR)}</code></li>
+            <li>VM/CT側ゲートウェイ: <code>10.10.10.1</code></li>
+            <li>VM/CT用IPは、基本 <code>10.10.10.10</code> から <code>10.10.10.254</code> の範囲で静的に決めます。</li>
+          </ul>
+          <p class="note">使用中NAT IP: {esc(used_ips)}</p>
+        </div>
+      </section>
+
+      <section class="wide">
+        <h2>Ubuntu Serverの静的IP設定例</h2>
+        <div class="body">
+          <div class="callout warn">VM/CT内のIPはDHCPではなく、基本的に静的に設定します。IPが重複すると通信が壊れます。</div>
+          {cmd_block('''sudo vi /etc/netplan/00-installer-config.yaml''')}
+          {config_block('''network:
+  version: 2
+  ethernets:
+    ens18:
+      addresses:
+        - 10.10.10.X/24
+      routes:
+        - to: default
+          via: 10.10.10.1
+      nameservers:
+        addresses:
+          - 133.220.5.3
+          - 133.220.149.120''')}
+          {cmd_block('''sudo netplan apply
+ip route
+resolvectl status''')}
+        </div>
+      </section>
+
+      <section>
+        <h2>VM操作コマンド</h2>
+        <div class="body">
+          <p class="note">PVE本体にSSHして実行します。</p>
+          <pre><code>qm list
+qm start &lt;VMID&gt;
+qm shutdown &lt;VMID&gt;
+qm reboot &lt;VMID&gt;
+qm stop &lt;VMID&gt;      # 最終手段。通常は shutdown</code></pre>
+        </div>
+      </section>
+
+      <section>
+        <h2>コンテナ操作コマンド</h2>
+        <div class="body">
+          <p class="note">LXCコンテナは <code>pct</code> で操作します。</p>
+          <pre><code>pct list
+pct start &lt;CTID&gt;
+pct shutdown &lt;CTID&gt;
+pct reboot &lt;CTID&gt;
+pct enter &lt;CTID&gt;</code></pre>
+        </div>
+      </section>
+
+      <section class="wide">
+        <h2>ポート転送</h2>
+        <div class="body">
+          <ul>
+            <li>VM/CTをNAT内に置いた場合、研究室LAN側から直接 <code>10.10.10.X</code> へは入れません。</li>
+            <li>外から入れたいサービスだけ、Proxmoxの外側ポートからVM/CT側ポートへ転送します。</li>
+            <li>外側ポートはProxmox側で重複禁止です。使用中: {esc(used_ports)}</li>
+          </ul>
+          {cmd_block('''pve-portfw
+pve-portfw list
+pve-portfw ports
+pve-portfw scan
+pve-portfw delete''')}
+          <p class="note">例: Proxmoxの2222番を VM 100 の22番へ転送</p>
+          {cmd_block('''pve-portfw add 100 2222 22 tcp ssh''')}
+        </div>
+      </section>
+
+      <section class="wide">
+        <h2>注意点</h2>
+        <div class="body">
+          <ul>
+            <li><code>{esc(EXT_IF)}</code> を選ぶと、そのVM/CTは研究室LANに直接出ます。IP割当ルールとセキュリティに注意します。</li>
+            <li><code>{esc(INT_IF)}</code> のゲートウェイ欄は空欄でOKです。VM/CTから見たゲートウェイが <code>10.10.10.1</code> です。</li>
+            <li>SSHやWebサーバを外から使いたい場合は、VM側サービスが待受していることを確認してからポート転送します。</li>
+            <li>よくわからなくなったら <code>pve-portfw doctor</code> で状態確認します。</li>
+          </ul>
+        </div>
+      </section>
+
+      <section class="wide">
+        <h2>SSHで「REMOTE HOST IDENTIFICATION HAS CHANGED!」が出たとき</h2>
+        <div class="body">
+          <div class="callout warn">同じIPアドレスや同じ外側ポートを別のVM/CTに使い回すと、SSHが以前の接続先と違う相手だと判断して接続を止めることがあります。</div>
+          <p class="note">PVE上からNAT内IPへSSHする場合の例:</p>
+          <pre><code>ssh-keygen -f /root/.ssh/known_hosts -R 10.10.10.101
+ssh ubuntu@10.10.10.101</code></pre>
+          <p class="note">自分のPCからポート転送経由でSSHする場合の例:</p>
+          <pre><code>ssh-keygen -R '[172.28.4.147]:2223'
+ssh ubuntu@172.28.4.147 -p 2223</code></pre>
+          <p class="note">VM名で鍵を覚えさせるなら、<code>HostKeyAlias</code> を使います。</p>
+          <pre><code>ssh -o HostKeyAlias=seikei-proxy ubuntu@172.28.4.147 -p 2223</code></pre>
+        </div>
+      </section>
+    </div>
+  </main>
+</body>
+</html>
+"""
+
+
+def render_doc_html(page):
+    context = build_help_context()
+    used_ips = ", ".join(context["used_ips"]) or "なし"
+    used_ports = ", ".join(context["used_external_ports"]) or "なし"
+    generated_at = context["generated_at"]
+
+    pages = {
+        "home": {
+            "path": "/",
+            "title": "このサーバーの使い方",
+            "body": f"""
+      <section class="wide">
+        <h2>入口</h2>
+        <div class="body">
+          <div class="callout">このWebは、PowerEdge R350 上の Proxmox VE でVM/CTを作って使うためのメモです。まず状況を見て、作りたいものに合わせてVMかCTの手順へ進みます。</div>
+          <table class="settings-table">
+            <thead><tr><th>やりたいこと</th><th>見るページ</th></tr></thead>
+            <tbody>
+              <tr><td>使われているNAT IPやポートを見る</td><td><a href="/status">状況</a></td></tr>
+              <tr><td>VMとCTの違いを知る</td><td><a href="/vmct">VM/CTとは</a></td></tr>
+              <tr><td>Ubuntu ServerなどをVMで作る</td><td><a href="/create-vm">VMの作り方</a></td></tr>
+              <tr><td>軽いLinux環境をCTで作る</td><td><a href="/create-ct">CTの作り方</a></td></tr>
+              <tr><td>vmbr1、IP、DNS、SSHで迷った</td><td><a href="/network">通信設定</a></td></tr>
+              <tr><td>研究室LAN側からVM/CTへ入りたい</td><td><a href="/portfw">ポート転送</a></td></tr>
+              <tr><td>SSHできない、警告が出た</td><td><a href="/trouble">困ったとき</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section>
+        <h2>このサーバー</h2>
+        <div class="body">
+          <table class="settings-table">
+            <tbody>
+              <tr><td>Proxmox管理画面</td><td><code>172.28.4.147:8006</code></td></tr>
+              <tr><td>ヘルプWeb</td><td><code>172.28.4.147:9090</code></td></tr>
+              <tr><td>iDRAC</td><td><code>172.28.4.146</code></td></tr>
+              <tr><td>VM/CT用ネットワーク</td><td><code>{esc(NAT_CIDR)}</code></td></tr>
+              <tr><td>VM/CT側ゲートウェイ</td><td><code>10.10.10.1</code></td></tr>
+              <tr><td>DNS</td><td><code>133.220.5.3</code><br><code>133.220.149.120</code></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+      <section>
+        <h2>よく使う入口</h2>
+        <div class="body">
+          <p class="note">PVE本体に入って作業するときの入口です。</p>
+          {cmd_block('''ssh root@172.28.4.147
+pve-portfw''')}
+          <p class="note">VM/CTへ外から継続して入りたいときは、PVE本体上で <code>pve-portfw</code> を使ってポート転送を作ります。</p>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>このサーバーの基本</h2>
+        <div class="body">
+          <ul>
+            <li>VM/CTを作るとき、ネットワークは基本 <code>{esc(INT_IF)}</code> を選びます。</li>
+            <li>VM/CTのIPは <code>10.10.10.X/24</code> にします。使う前に <a href="/status">状況</a> で重複を確認します。</li>
+            <li>研究室LANに直接出す必要がある場合だけ <code>{esc(EXT_IF)}</code> を選びます。固定IPの割当は教授に確認します。</li>
+            <li>困ったらまず <a href="/network">通信設定</a> と <a href="/trouble">困ったとき</a> を見ます。</li>
+          </ul>
+        </div>
+      </section>
+            """,
+        },
+        "vmct": {
+            "path": "/vmct",
+            "title": "VM/CTとは",
+            "body": f"""
+      <section class="wide">
+        <h2>VM/CTとは</h2>
+        <div class="body">
+          <div class="callout">Proxmoxでは、サーバの中に「VM」または「CT」という小さな実行環境を作って使います。</div>
+          <ul>
+            <li><strong>VM</strong> は Virtual Machine、つまりバーチャルマシンです。仮想的なPC/サーバを1台作るイメージです。</li>
+            <li><strong>CT</strong> は Container、Proxmoxでは主にLXCコンテナのことです。軽いLinux環境を作るイメージです。</li>
+            <li>どちらもProxmox上ではIDで管理されます。例: <code>100</code>, <code>101</code>。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>VM: バーチャルマシン</h2>
+        <div class="body">
+          <ul>
+            <li>CPU、メモリ、ディスク、NICなどを仮想的に持つ、独立したマシンです。</li>
+            <li>Ubuntu ServerやWindowsなどをISOからインストールできます。</li>
+            <li>OSのカーネルもVMごとに独立します。実験で壊しても他のVMへ影響しにくいです。</li>
+            <li>CTより少し重いですが、迷ったらVMを選ぶのが安全です。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>CT: コンテナ</h2>
+        <div class="body">
+          <ul>
+            <li>ホストのLinuxカーネルを共有して動く、軽量なLinux環境です。</li>
+            <li>起動が速く、メモリやディスクの消費も少なめです。</li>
+            <li>Linux用途向けです。WindowsはCTでは動かせません。</li>
+            <li>カーネルを触る実験や強い隔離が必要な用途はVMのほうが向きます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>どちらを選ぶか</h2>
+        <div class="body">
+          <ul>
+            <li>Ubuntu Serverを普通に立てる、ネットワーク実験をする、OSごと触りたい: <strong>VM</strong></li>
+            <li>軽いLinuxサービスをさっと置く、検証用の小さい環境を作る: <strong>CT</strong></li>
+            <li>迷ったらVM。軽さが必要になったらCTを考える、くらいでOKです。</li>
+            <li>VM/CTを作るとき、ネットワークは基本 <code>{esc(INT_IF)}</code> を選びます。</li>
+          </ul>
+        </div>
+      </section>
+            """,
+        },
+        "create-vm": {
+            "path": "/create-vm",
+            "title": "VMの作り方",
+            "body": f"""
+      <section class="wide">
+        <h2>VM作成画面の流れ</h2>
+        <div class="body">
+          <div class="callout">試しに一つVMを作ってみましょう。</div>
+          <ul>
+            <li>右上の <strong>VMを作成</strong> から始めます。</li>
+            <li>基本的に触るのは <strong>OS</strong>、必要なら <strong>ディスク/CPU/メモリ</strong>、そして必ず <strong>ネットワーク</strong> です。</li>
+            <li>ネットワーク以外は、目的がなければ既定値のままでOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>1. 全般</h2>
+        <div class="body">
+          {screenshot_figure("01-general.png", "全般: VM名を入れる画面")}
+          <ul>
+            <li><strong>名前</strong> に自分がわかるVM名を入れます。</li>
+            <li><strong>VM ID</strong> はProxmox上の管理番号です。基本そのままでOKです。</li>
+            <li>ホスト名、Ubuntuのユーザー名、パスワードは後でUbuntuインストール中に決めます。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>2. OS</h2>
+        <div class="body">
+          {screenshot_figure("02-os.png", "OS: ISOイメージを選ぶ画面")}
+          <ul>
+            <li>好きなISOイメージを選びます。</li>
+            <li>このページの例では <strong>Ubuntu Server</strong> を選んだ前提で進めます。</li>
+            <li>Ubuntu DesktopやDebianなど、別のISOを選ぶこともできます。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>3. システム</h2>
+        <div class="body">
+          {screenshot_figure("03-system.png", "システム: 変更なしで進む画面")}
+          <ul>
+            <li>ここは変更なしでOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>4. ディスク</h2>
+        <div class="body">
+          {screenshot_figure("04-disk.png", "ディスク: ディスクサイズを確認する画面")}
+          <ul>
+            <li>基本はいじらなくてOKです。</li>
+            <li>変えるなら <strong>ディスクサイズ</strong> です。ディスクサイズはVMに割り当てるストレージ容量です。</li>
+            <li>ディスクサイズは後から増やすこともできます。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>5. CPU</h2>
+        <div class="body">
+          {screenshot_figure("05-cpu.png", "CPU: コア数を設定する画面")}
+          <ul>
+            <li>性能が必要なら <strong>コア</strong> を増やします。後から変更できます。</li>
+            <li><strong>ソケット</strong> は仮想CPUを何個のCPUパッケージとして見せるかの設定です。普通は <code>1</code> のままでOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>6. メモリ</h2>
+        <div class="body">
+          {screenshot_figure("06-memory.png", "メモリ: メモリ量を設定する画面")}
+          <ul>
+            <li>用途に合わせて好きな値にします。これも後から変更できます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>7. ネットワーク</h2>
+        <div class="body">
+          {screenshot_figure("07-network.png", "ネットワーク: ブリッジにvmbr1を選ぶ画面")}
+          <div class="callout warn">ここが重要です。ブリッジは基本 <code>{esc(INT_IF)}</code> を選びます。</div>
+          <p class="note">なぜ <code>{esc(INT_IF)}</code> を使うのかは <a href="/network">通信設定</a> にまとめています。</p>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>8. 確認</h2>
+        <div class="body">
+          {screenshot_figure("08-confirm.png", "確認: net0のbridge=vmbr1を確認する画面")}
+          <ul>
+            <li><code>net0</code> に <code>bridge={esc(INT_IF)}</code> が入っていたらOKです。</li>
+            <li>問題なければ <strong>完了</strong> を押します。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>作成したVMを起動する</h2>
+        <div class="body">
+          <ul>
+            <li>作成後、左ペインに自分のVM IDが出ます。</li>
+            <li>そのVMをクリックして、<strong>コンソール</strong> を開きます。</li>
+            <li><strong>Start Now</strong> を押すとUbuntu Serverのインストールが始まります。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>Ubuntu Serverをインストールする</h2>
+        <div class="body">
+          <div class="callout">ここからはUbuntu Serverのインストーラー画面です。日本語はありません。基本は <strong>Enter</strong> と矢印キーで進めます。</div>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>起動メニュー (1/18)</h2>
+        <div class="body">
+          {screenshot_figure("01-grub.png", "起動直後: Try or Install Ubuntu Server を選んでEnter", "ubuntu-install")}
+          <ul>
+            <li>この画面になったら、そのまま <strong>Enter</strong> を押します。</li>
+            <li>そのあと、いろいろなログが流れます。しばらく待ちます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>言語選択 (2/18)</h2>
+        <div class="body">
+          {screenshot_figure("02-language.png", "言語選択: JapaneseはないのでEnglishのまま進む", "ubuntu-install")}
+          <ul>
+            <li>日本語はありません。<strong>English</strong> のままEnterで進みます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>キーボード設定 (3/18)</h2>
+        <div class="body">
+          {screenshot_figure("03-keyboard.png", "キーボード設定: そのままDone", "ubuntu-install")}
+          <ul>
+            <li>キーボード設定は、基本そのまま <strong>Done</strong> でOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>インストール種類 (4/18)</h2>
+        <div class="body">
+          {screenshot_figure("04-install-type.png", "インストール種類: Ubuntu ServerのままDone", "ubuntu-install")}
+          <ul>
+            <li><strong>Ubuntu Server</strong> のまま進みます。</li>
+            <li>追加ドライバのチェックも、基本そのままでOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>ネットワーク設定を開く (5/18)</h2>
+        <div class="body">
+          <div class="callout warn">ネットワーク設定が超大事です。ここでは必ず静的IPにします。他のISOでも、ネットワーク設定画面では静的設定を選びます。</div>
+          {screenshot_figure("05-network-menu.png", "ネットワーク設定: ens18を選んでEdit IPv4", "ubuntu-install")}
+          <ul>
+            <li>インターフェース <code>ens18</code> を選んでEnterを押します。</li>
+            <li>メニューが出たら <strong>Edit IPv4</strong> を選びます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>Manualを選ぶ (6/18)</h2>
+        <div class="body">
+          {screenshot_figure("06-network-manual.png", "IPv4 Method: Manualを選ぶ", "ubuntu-install")}
+          <ul>
+            <li><strong>Manual</strong> を選んでEnterします。</li>
+            <li>DHCPではなく、VMごとに静的IPを決めるためです。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>IP/Gateway/DNSを入力 (7/18)</h2>
+        <div class="body">
+          {screenshot_figure("07-network-input.png", "Manual設定: IP/Gateway/DNSを入力", "ubuntu-install")}
+          <ul>
+            <li>Subnetは <code>10.10.10.0/24</code> です。</li>
+            <li>Addressは <code>10.10.10.2</code> から <code>10.10.10.254</code> の範囲で好きに決めます。</li>
+            <li>ほかのVM/CTと衝突しないように、必ず <a href="/status">状況</a> の使用中IPを確認します。</li>
+            <li>迷ったら、VM IDとホスト部を合わせるのが安全です。例: VM IDが102なら <code>10.10.10.102</code>。</li>
+            <li>Gatewayは <code>10.10.10.1</code> にします。</li>
+            <li>Name serversは <code>133.220.5.3, 133.220.149.120</code> のようにカンマ区切りで入れます。</li>
+            <li>Search domainsは空欄でOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>IP表示を確認 (8/18)</h2>
+        <div class="body">
+          {screenshot_figure("08-network-done.png", "自分のIPが表示されたらDone", "ubuntu-install")}
+          <ul>
+            <li>自分のIPが表示されていれば <strong>Done</strong> で進みます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>プロキシ設定 (9/18)</h2>
+        <div class="body">
+          {screenshot_figure("09-proxy.png", "Proxy configuration: 空欄のままDone", "ubuntu-install")}
+          <ul>
+            <li>Proxy addressは空欄のままEnterでOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>ミラー設定 (10/18)</h2>
+        <div class="body">
+          {screenshot_figure("10-mirror.png", "Ubuntu archive mirror configuration: そのままDone", "ubuntu-install")}
+          <ul>
+            <li>Ubuntu archive mirror configurationも、そのまま <strong>Done</strong> でOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>ストレージ方式 (11/18)</h2>
+        <div class="body">
+          {screenshot_figure("11-guided-storage.png", "Guided storage configuration: そのままDone", "ubuntu-install")}
+          <ul>
+            <li>Guided storage configurationは、そのまま <strong>Done</strong> で進みます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>ストレージ確認 (12/18)</h2>
+        <div class="body">
+          {screenshot_figure("12-storage-summary.png", "Storage configuration: 内容を確認してDone", "ubuntu-install")}
+          <ul>
+            <li>Storage configurationも、何も変えずに <strong>Done</strong> でOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>ディスク初期化の確認 (13/18)</h2>
+        <div class="body">
+          {screenshot_figure("13-storage-confirm.png", "Confirm destructive action: Continueで進む", "ubuntu-install")}
+          <ul>
+            <li>確認で何か聞かれたら <strong>Continue</strong> で進みます。</li>
+            <li>これはVMの仮想ディスクを初期化する確認です。Proxmox本体のディスクを消す画面ではありません。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>ユーザー情報 (14/18)</h2>
+        <div class="body">
+          {screenshot_figure("14-profile.png", "Profile configuration: ユーザー名とパスワードを入力", "ubuntu-install")}
+          <ul>
+            <li>Your nameは空白でもOKです。</li>
+            <li>Your server's nameは、VM作成時の名前と同じにしておくと分かりやすいです。</li>
+            <li>Pick a usernameは、SSHやログインで使うユーザー名です。分かりやすい名前にします。</li>
+            <li>パスワードは好きに決めてOKです。ログイン時とSSH時に使うので忘れないようにします。</li>
+            <li>入力が終わったら <strong>Done</strong> で進みます。</li>
+          </ul>
+          <p class="note">サーバー名はSSH接続時に必須ではありませんが、コンソール表示、ログ、名前解決を設定したときなどに出てきます。VM名と合わせておくと管理しやすいです。</p>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>Ubuntu Pro (15/18)</h2>
+        <div class="body">
+          {screenshot_figure("15-ubuntu-pro.png", "Upgrade to Ubuntu Pro: Skip for now", "ubuntu-install")}
+          <ul>
+            <li>Ubuntu Proを勧められたら、今回は <strong>Skip for now</strong> でOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>SSHサーバー (16/18)</h2>
+        <div class="body">
+          {screenshot_figure("16-ssh.png", "SSH configuration: Install OpenSSH serverにチェック", "ubuntu-install")}
+          <ul>
+            <li>SSH configurationでは <strong>Install OpenSSH server</strong> にチェックを入れます。</li>
+            <li>SSH keyのインポートは無視してOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>追加パッケージ (17/18)</h2>
+        <div class="body">
+          {screenshot_figure("17-snaps.png", "Featured server snaps: 何も選ばずDone", "ubuntu-install")}
+          <ul>
+            <li>Featured server snapsは、そのまま何も選ばず <strong>Done</strong> で進みます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>インストール完了待ち (18/18)</h2>
+        <div class="body">
+          {screenshot_figure("18-installing.png", "Installing system: インストール完了まで待つ", "ubuntu-install")}
+          <ul>
+            <li>インストールが始まります。しばらく待ちます。</li>
+            <li>終わったら再起動ボタンが出るので押します。</li>
+            <li>再起動後、決めたユーザー名とパスワードでログインできることを確認します。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>インストール後: ISOを外す</h2>
+        <div class="body">
+          <div class="callout">Ubuntuのインストールが終わったら、ISOを外しておきます。次回起動時にインストーラーへ戻る事故を防ぐためです。</div>
+          {screenshot_figure("09-cdrom-hardware.png", "ハードウェア: CD/DVDドライブを選んで編集", "vm-create")}
+          <ul>
+            <li>VMの <strong>ハードウェア</strong> を開きます。</li>
+            <li><strong>CD/DVD ドライブ</strong> を選択して、上の <strong>編集</strong> を押します。</li>
+          </ul>
+          {screenshot_figure("10-cdrom-unused.png", "CD/DVD Drive: メディアを使用しないを選んでOK", "vm-create")}
+          <ul>
+            <li><strong>メディアを使用しない</strong> を選んで <strong>OK</strong> を押します。</li>
+          </ul>
+          {screenshot_figure("11-cdrom-none.png", "適用後: none,media=cdromになっていればOK", "vm-create")}
+          <ul>
+            <li>適用後、CD/DVDドライブが <code>none,media=cdrom</code> になっていればOKです。</li>
+          </ul>
+        </div>
+      </section>
+            """,
+        },
+        "create-ct": {
+            "path": "/create-ct",
+            "title": "CTの作り方",
+            "body": f"""
+      <section class="wide">
+        <h2>CT作成画面の流れ</h2>
+        <div class="body">
+          <div class="callout">試しに一つコンテナを作ってみましょう。右上の <strong>CTを作成</strong> から始めます。</div>
+          <ul>
+            <li>CTはLinuxコンテナです。VMより軽く、UbuntuなどのLinux環境をすばやく作れます。</li>
+            <li>VMと違って、OSインストーラーは起動しません。テンプレートを展開して作ります。</li>
+            <li>IPアドレスはCT作成画面で設定できます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>全般 (1/8)</h2>
+        <div class="body">
+          {screenshot_figure("01-general.png", "全般: ホスト名とパスワードを入力", "ct-create")}
+          <ul>
+            <li><strong>ホスト名</strong> にコンテナ名を入れます。これはユーザー名ではありません。</li>
+            <li>CT作成時のパスワードは、コンテナ内の <code>root</code> ユーザーのパスワードです。</li>
+            <li>作成直後のログインユーザーは基本 <code>root</code> です。SSHも、sshdが動いていれば <code>root@10.10.10.X</code> で入ります。</li>
+            <li><strong>非特権コンテナ</strong> と <strong>ネスト</strong> は、そのままでOKです。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>テンプレート (2/8)</h2>
+        <div class="body">
+          {screenshot_figure("02-template.png", "テンプレート: Ubuntuなどのテンプレートを選ぶ", "ct-create")}
+          <ul>
+            <li>テンプレートを選びます。この例ではUbuntuのテンプレートを使います。</li>
+            <li>テンプレートは、コンテナ用に用意されたLinuxのファイル一式です。</li>
+            <li>VMのISOイメージは「インストーラーを起動してOSを入れるもの」、CTのテンプレートは「展開したらすぐLinux環境になるもの」です。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>ディスク (3/8)</h2>
+        <div class="body">
+          {screenshot_figure("03-disk.png", "ディスク: rootfsのサイズを決める", "ct-create")}
+          <ul>
+            <li>基本はこのままでOKです。</li>
+            <li>ディスクサイズは、コンテナに割り当てるストレージ容量です。</li>
+            <li>必要なら増やします。後から変更することもできます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>CPU (4/8)</h2>
+        <div class="body">
+          {screenshot_figure("04-cpu.png", "CPU: コア数を決める", "ct-create")}
+          <ul>
+            <li>コア数を決めます。軽い用途ならそのままでOKです。</li>
+            <li>後から変更できます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>メモリ (5/8)</h2>
+        <div class="body">
+          {screenshot_figure("05-memory.png", "メモリ: メモリとスワップを決める", "ct-create")}
+          <ul>
+            <li>メモリはコンテナに割り当てるRAMです。用途に合わせて変えます。</li>
+            <li>スワップは、メモリが足りないときに一時的にディスク側へ逃がす領域です。</li>
+            <li>スワップは遅いので、普段から使い続けるものではありません。迷ったら既定値でOKです。</li>
+            <li>メモリもスワップも後から変更できます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>ネットワーク (6/8)</h2>
+        <div class="body">
+          <div class="callout warn">ここが重要です。ブリッジは基本 <code>{esc(INT_IF)}</code> を選び、IPv4は静的に決めます。</div>
+          {screenshot_figure("06-network.png", "ネットワーク: vmbr1と静的IPv4を設定", "ct-create")}
+          <ul>
+            <li>ブリッジは <code>{esc(INT_IF)}</code> を選びます。</li>
+            <li>IPv4は <strong>静的</strong> を選びます。</li>
+            <li>IPv4/CIDRは <code>10.10.10.X/24</code> の形で入れます。</li>
+            <li>使えるIPは <code>10.10.10.2</code> から <code>10.10.10.254</code> です。</li>
+            <li>ほかのVM/CTと衝突しないように、必ず <a href="/status">状況</a> の使用中IPを確認します。</li>
+            <li>Gatewayは <code>10.10.10.1</code> にします。</li>
+          </ul>
+          <p class="note">詳しいネットワークの考え方は <a href="/network">通信設定</a> にまとめています。</p>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>DNS (7/8)</h2>
+        <div class="body">
+          {screenshot_figure("07-dns.png", "DNS: ホスト設定を使用でOK", "ct-create")}
+          <ul>
+            <li>基本は <strong>ホスト設定を使用</strong> のままでOKです。</li>
+            <li>Proxmox本体のDNS設定をコンテナが使います。</li>
+            <li>個別に指定したいときだけ、DNSサーバーへ <code>133.220.5.3 133.220.149.120</code> を入れます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>確認 (8/8)</h2>
+        <div class="body">
+          {screenshot_figure("08-confirm.png", "確認: bridgeとIPを確認して完了", "ct-create")}
+          <ul>
+            <li>特に <code>net0</code> を確認します。</li>
+            <li><code>bridge={esc(INT_IF)}</code> になっていることを確認します。</li>
+            <li><code>ip=10.10.10.X/24</code> と <code>gw=10.10.10.1</code> が正しいことを確認します。</li>
+            <li>問題なければ <strong>完了</strong> を押します。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>作成後</h2>
+        <div class="body">
+          <ul>
+            <li>CTを起動し、Proxmox本体から <code>pct enter &lt;CTID&gt;</code> で入れるか確認します。</li>
+            <li>例: CT IDが103なら <code>pct enter 103</code> です。</li>
+            <li>PVEから <code>10.10.10.X</code> へ通信できるか確認します。</li>
+            <li>Ubuntu系コンテナでは、rootのSSHログインが許可されていないことがあります。</li>
+            <li>SSHで入りたい場合は、コンテナ内で一般ユーザーを作り、SSHサーバーを入れて起動します。</li>
+            <li>研究室LAN側から入りたい場合は <a href="/portfw">ポート転送</a> を設定します。</li>
+          </ul>
+          {cmd_block('''pct enter 103''')}
+          <p class="note">コンテナに入ったあと、SSH用ユーザーを作る例です。ユーザー名は好きなものに変えてOKです。</p>
+          {cmd_block('''
+apt update
+apt install -y sudo openssh-server
+adduser icn
+usermod -aG sudo icn
+systemctl enable --now ssh
+          ''')}
+          <p class="note">設定できたらコンテナから出て、PVEまたは自分のPCからSSHします。</p>
+          {cmd_block('''
+exit
+ssh icn@10.10.10.103
+          ''')}
+        </div>
+      </section>
+            """,
+        },
+        "network": {
+            "path": "/network",
+            "title": "通信設定",
+            "body": f"""
+      <section class="wide">
+        <h2>迷ったらvmbr1</h2>
+        <div class="body">
+          <div class="callout">VM/CTを作るときは、基本 <code>{esc(INT_IF)}</code> を選びます。</div>
+          <ul>
+            <li><code>{esc(EXT_IF)}</code> は研究室LANへ直接つなぐ設定で、VM/CTに <code>172.28.4.XX</code> が割り当たる側です。</li>
+            <li><code>{esc(EXT_IF)}</code> を使う場合は、固定IPの割当と許可を確認してください。</li>
+            <li>外からVM/CTへ入りたいときは、まずポート転送を使います。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>vmbrとは</h2>
+        <div class="body">
+          <p><code>vmbr</code> は Proxmox 上の仮想スイッチです。VM/CTの仮想LANケーブルをどのスイッチに挿すか、という設定だと思うと分かりやすいです。</p>
+          <table class="settings-table">
+            <thead>
+              <tr><th>ブリッジ</th><th>役割</th><th>選ぶ場面</th></tr>
+            </thead>
+            <tbody>
+              <tr><td><code>{esc(EXT_IF)}</code></td><td>研究室LANにつながる外側の仮想スイッチ</td><td>研究室LANの固定IPを正式に割り当てるときだけ</td></tr>
+              <tr><td><code>{esc(INT_IF)}</code></td><td>Proxmox内側のNAT用仮想スイッチ</td><td>通常のVM/CT作成はこちら</td></tr>
+            </tbody>
+          </table>
+          {screenshot_figure("topology.svg", "", "network")}
+        </div>
+      </section>
+      <section>
+        <h2>なぜvmbr1なのか</h2>
+        <div class="body">
+          <ul>
+            <li>研究室LANの固定IPを消費しません。</li>
+            <li>VM/CTを増やしても、研究室LAN側のIP管理が増えにくいです。</li>
+            <li>VM/CTが研究室LANへ直接公開されにくくなります。</li>
+            <li>実験用VM/CTを作ったり消したりしやすいです。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>vmbr0を使うとき</h2>
+        <div class="body">
+          <div class="callout warn"><code>{esc(EXT_IF)}</code> を選ぶと、そのVM/CTは研究室LAN上の1台として見えます。固定IPの割当と許可を確認してから使います。</div>
+          <ul>
+            <li>VM/CTに <code>172.28.4.X</code> の固定IPが必要です。</li>
+            <li>研究室LANの他の機器から直接見えるので、SSHやWebサービスの公開範囲に注意します。</li>
+            <li>サーバー系の固定IPは研究室のルールに従います。</li>
+            <li>迷ったら <code>{esc(INT_IF)}</code> を使い、必要な入口だけポート転送で開けます。</li>
+          </ul>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>研究室IPポリシー</h2>
+        <div class="body">
+          {screenshot_figure("ip-policy.png", "研究室LAN管理ポリシー: 固定IPは研究室管理。利用したい場合は教授に連絡すること", "network")}
+          <table class="settings-table">
+            <thead>
+              <tr><th>項目</th><th>値</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>研究室LANネットワーク</td><td><code>172.28.4.128/25</code></td></tr>
+              <tr><td>研究室LANゲートウェイ</td><td><code>172.28.4.129</code></td></tr>
+              <tr><td>固定IPレンジ</td><td><code>172.28.4.130-172.28.4.191</code></td></tr>
+              <tr><td>DHCPレンジ</td><td><code>172.28.4.192-172.28.4.254</code></td></tr>
+              <tr><td>DNS</td><td><code>133.220.5.3</code><br><code>133.220.149.120</code></td></tr>
+              <tr><td>サーバー/共用設備</td><td><code>172.28.4.140-172.28.4.169</code></td></tr>
+            </tbody>
+          </table>
+          <p class="note">このサーバーでは iDRAC に <code>172.28.4.146</code>、Proxmox に <code>172.28.4.147</code> を使っています。</p>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>このサーバーのIPルール</h2>
+        <div class="body">
+          <table class="settings-table">
+            <thead>
+              <tr><th>対象</th><th>IP/設定</th><th>説明</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>iDRAC</td><td><code>172.28.4.146</code></td><td>ハードウェア管理画面</td></tr>
+              <tr><td>Proxmox</td><td><code>172.28.4.147:8006</code></td><td>Proxmox管理画面</td></tr>
+              <tr><td>ヘルプWeb</td><td><code>172.28.4.147:9090</code></td><td>このページ</td></tr>
+              <tr><td>NAT内ネットワーク</td><td><code>{esc(NAT_CIDR)}</code></td><td>VM/CT用の内側ネットワーク</td></tr>
+              <tr><td>VM/CT側ゲートウェイ</td><td><code>10.10.10.1</code></td><td>Proxmoxの <code>{esc(INT_IF)}</code></td></tr>
+              <tr><td>VM/CT用IP</td><td><code>10.10.10.2-10.10.10.254</code></td><td>重複しないように静的に決める</td></tr>
+            </tbody>
+          </table>
+          <p class="note">使用中NAT IP: {esc(used_ips)}</p>
+        </div>
+      </section>
+      <section class="wide">
+        <h2>VM/CTへの入り方</h2>
+        <div class="body">
+          <ul>
+            <li>PVEにSSHしてからVM/CTへ入るのが一番わかりやすいです。</li>
+            <li>CTなら <code>pct enter &lt;CTID&gt;</code> で直接入れます。</li>
+            <li>自分のPCから直接入りたい場合は、二段階SSHかポート転送を使います。</li>
+          </ul>
+          <p class="note">まず自分のPCからPVEへSSHします。</p>
+          {cmd_block('''ssh root@172.28.4.147''')}
+          <p class="note">VMへ入る場合は、PVE上からVMへSSHします。</p>
+          {cmd_block('''ssh ubuntu@10.10.10.X''')}
+          <p class="note">CTへ入る場合は、PVE上で <code>pct enter</code> を使います。これはSSHではありません。</p>
+          {cmd_block('''pct enter 103''')}
+          <p class="note">自分のPCから1コマンドで入りたい場合は ProxyJump も使えます。</p>
+          {cmd_block('''ssh -J root@172.28.4.147 ubuntu@10.10.10.X''')}
+          <p class="note">継続して使う入口を作るなら、PVE本体上で <code>pve-portfw</code> を実行して <a href="/portfw">ポート転送</a> を設定します。</p>
+          {cmd_block('''
+pve-portfw
+ssh ubuntu@172.28.4.147 -p 2222
+          ''')}
+        </div>
+      </section>
+      <section class="wide">
+        <h2>IPアドレスを変更する</h2>
+        <div class="body">
+          <div class="callout warn">IPを変える前に、必ず <a href="/status">状況</a> で使用中IPを確認します。重複すると通信が壊れます。</div>
+          <p><strong>Ubuntu VMの場合</strong></p>
+          {cmd_block('''sudo vi /etc/netplan/00-installer-config.yaml''')}
+          <p class="note">黄色の部分を、自分のVMに割り当てるIPへ変えます。</p>
+          {highlighted_config_block('''network:
+  version: 2
+  ethernets:
+    ens18:
+      addresses:
+        - 10.10.10.X/24
+      routes:
+        - to: default
+          via: 10.10.10.1
+      nameservers:
+        addresses:
+          - 133.220.5.3
+          - 133.220.149.120''', ["10.10.10.X/24"])}
+          {cmd_block('''
+sudo netplan apply
+ip route
+ping -c 3 10.10.10.1
+          ''')}
+          <p><strong>CTの場合</strong></p>
+          <p class="note">Proxmox本体で実行します。黄色の <code>103</code> と <code>10.10.10.X/24</code> は自分のCTに合わせます。</p>
+          {highlighted_cmd_block('''
+pct set 103 -net0 name=eth0,bridge=vmbr1,firewall=1,ip=10.10.10.X/24,gw=10.10.10.1
+pct reboot 103
+          ''', ["103", "10.10.10.X/24"])}
+          <p><strong>Proxmox本体やiDRACの場合</strong></p>
+          <p class="note">Proxmox本体やiDRACのIPを変えると管理画面へ入れなくなることがあります。基本は管理者だけが変更します。</p>
+        </div>
+      </section>
+      <section>
+        <h2>困ったとき</h2>
+        <div class="body">
+          <ul>
+            <li><code>ip route</code> でゲートウェイが正しいか見ます。</li>
+            <li><code>10.10.10.1</code> にpingできれば、VM/CTからProxmoxまでは届いています。</li>
+            <li><code>8.8.8.8</code> にpingできれば、外部IPへの通信はできています。</li>
+            <li><code>google.com</code> にpingできなければDNSを疑います。</li>
+          </ul>
+          {cmd_block('''
+ip route
+ping -c 3 10.10.10.1
+ping -c 3 8.8.8.8
+ping -c 3 google.com
+          ''')}
+        </div>
+      </section>
+      <section>
+        <h2>PVE側で確認する</h2>
+        <div class="body">
+          <p class="note">Proxmox本体で実行します。NAT、ポート転送、登録IPをまとめて確認できます。</p>
+          {cmd_block('''
+pve-portfw list
+pve-portfw doctor
+pve-portfw ports
+          ''')}
+        </div>
+      </section>
+            """,
+        },
+        "portfw": {
+            "path": "/portfw",
+            "title": "ポート転送",
+            "body": f"""
+      <section class="wide">
+        <h2>ポート転送とは</h2>
+        <div class="body">
+          <div class="callout">研究室LAN側から、NAT内のVM/CTへ入るための入口をProxmox本体に作る設定です。</div>
+          <p><code>vmbr1</code> にいるVM/CTは <code>10.10.10.X</code> の内側IPを持っています。このIPは研究室LAN側のPCから直接は見えません。そこで <code>172.28.4.147:外側ポート</code> に来た通信を、VM/CTの <code>10.10.10.X:VM側ポート</code> へ流します。</p>
+          <pre><code>研究室PC
+  |
+  | 172.28.4.147:2222
+  v
+Proxmox本体
+  |
+  | 10.10.10.11:22
+  v
+NAT内のVM/CT</code></pre>
+        </div>
+      </section>
+      <section>
+        <h2>使いたくなる場面</h2>
+        <div class="body">
+          <ul>
+            <li>自分のPCからVM/CTへSSHしたい。</li>
+            <li>VM/CT内で立てたWebアプリを研究室LANから見たい。</li>
+            <li>二段階SSHを毎回打つのが面倒。</li>
+            <li><code>vmbr1</code> のまま、必要なサービスだけ外へ出したい。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>なぜツールがあるのか</h2>
+        <div class="body">
+          <p>ポート転送は中身としてはiptablesの設定です。ただし、毎回iptablesを手で書くのはだるすぎます。長いコマンドを間違えやすいし、あとから「どのVMに何番を開けたか」も分かりにくくなります。</p>
+          <ul>
+            <li>VM/CT名とNAT内IPを台帳で管理します。</li>
+            <li>外側ポートの重複を避けやすくします。</li>
+            <li>再起動後もルールを復元します。</li>
+            <li>消したVM/CTに紐づく古いルールを見つけやすくします。</li>
+          </ul>
+        </div>
+      </section>
+      <section>
+        <h2>どこで実行するか</h2>
+        <div class="body">
+          <div class="callout warn">操作はVM/CT内ではなく、PVE本体にSSHしてから実行します。</div>
+          <p class="note">まず自分のPCからPVE本体へ入ります。</p>
+          {cmd_block('''ssh root@172.28.4.147''')}
+          <p class="note">PVE本体に入ったら、対話メニューを開きます。</p>
+          {cmd_block('''pve-portfw''')}
+        </div>
+      </section>
+      <section class="wide">
+        <h2>基本の流れ</h2>
+        <div class="body">
+          <table class="settings-table">
+            <thead>
+              <tr><th>順番</th><th>やること</th><th>例</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>1</td><td>転送先のVM/CTを選ぶ</td><td><code>ubuntu-test</code></td></tr>
+              <tr><td>2</td><td>外側ポートを決める</td><td><code>2222</code></td></tr>
+              <tr><td>3</td><td>VM側ポートを決める</td><td><code>22</code></td></tr>
+              <tr><td>4</td><td>メモを入れる</td><td><code>ssh-ubuntu-test</code></td></tr>
+              <tr><td>5</td><td>研究室LAN側から接続する</td><td><code>ssh ubuntu@172.28.4.147 -p 2222</code></td></tr>
+            </tbody>
+          </table>
+          <p class="note">外側ポートはProxmox本体側で待ち受ける番号、VM側ポートはVM/CT内のサービスが待ち受ける番号です。</p>
+        </div>
+      </section>
+      <section>
+        <h2>よく使う操作</h2>
+        <div class="body">
+          <p class="note">対話メニューを開きます。普段はこれだけ覚えれば大丈夫です。</p>
+          {cmd_block('''pve-portfw''')}
+          <p class="note">台帳と転送ルールを確認します。</p>
+          {cmd_block('''pve-portfw list''')}
+          <p class="note">使用中の外側ポートを確認します。</p>
+          {cmd_block('''pve-portfw ports''')}
+          <p class="note">転送ルールを消します。</p>
+          {cmd_block('''pve-portfw delete''')}
+        </div>
+      </section>
+      <section>
+        <h2>接続例</h2>
+        <div class="body">
+          <p class="note">Proxmoxの外側ポート <code>2222</code> をVM側の <code>22</code> に転送した場合です。</p>
+          {cmd_block('''ssh ubuntu@172.28.4.147 -p 2222''')}
+          <p class="note">Webアプリなら、たとえば外側 <code>8080</code> をVM側 <code>80</code> に転送します。</p>
+          {cmd_block('''http://172.28.4.147:8080/''')}
+        </div>
+      </section>
+      <section class="wide">
+        <h2>注意点</h2>
+        <div class="body">
+          <ul>
+            <li>外側ポートは重複できません。使用中: {esc(used_ports)}</li>
+            <li>VM/CT側でサービスが待ち受けていないポートへ転送しても接続できません。</li>
+            <li>SSHならVM/CT側ポートは通常 <code>22</code> です。</li>
+            <li>Proxmox本体の <code>8006</code>、SSHの <code>22</code> などと外側ポートをぶつけないようにします。</li>
+            <li>VM/CTを消したら、不要な転送ルールも消します。</li>
+          </ul>
+          {cmd_block('''pve-portfw doctor''')}
+        </div>
+      </section>
+            """,
+        },
+        "trouble": {
+            "path": "/trouble",
+            "title": "困ったとき",
+            "body": f"""
+      <section class="wide">
+        <h2>VM/CTにSSHできない</h2>
+        <div class="body">
+          <div class="callout warn">まずPVE本体で、VM/CTが起動しているか確認します。VM/CTの中ではなく <code>root@pve</code> で実行します。</div>
+          <p class="note">VMの状態を見る。<code>100</code> はVM IDに置き換えます。</p>
+          {cmd_block('''qm status 100''')}
+          <p class="note">VMが止まっていたら起動します。</p>
+          {cmd_block('''qm start 100''')}
+          <p class="note">CTの状態を見る。<code>103</code> はCT IDに置き換えます。</p>
+          {cmd_block('''pct status 103''')}
+          <p class="note">CTが止まっていたら起動します。</p>
+          {cmd_block('''pct start 103''')}
+          <table class="settings-table">
+            <thead>
+              <tr><th>確認</th><th>どこで実行</th><th>コマンド</th><th>見ること</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>通信経路</td><td>VM/CT内</td><td><code>ip route</code></td><td><code>default via 10.10.10.1</code> があるか</td></tr>
+              <tr><td>SSHサービス</td><td>VM/CT内</td><td><code>systemctl status ssh</code></td><td><code>active</code> になっているか</td></tr>
+              <tr><td>SSH接続</td><td>PVE本体</td><td><code>ssh ユーザー名@10.10.10.X</code></td><td>PVEからVM/CTへ入れるか</td></tr>
+            </tbody>
+          </table>
+          <p class="note">VM/CT内で通信経路を見る。</p>
+          {cmd_block('''ip route''')}
+          <p class="note">VM/CT内でSSHサービスを見る。止まっていたら起動します。</p>
+          {cmd_block('''sudo systemctl status ssh''')}
+          {cmd_block('''sudo systemctl enable --now ssh''')}
+          <p class="note">PVE本体からVM/CTへSSHします。</p>
+          {cmd_block('''ssh ubuntu@10.10.10.X''')}
+        </div>
+      </section>
+      <section class="wide">
+        <h2>SSHで「REMOTE HOST IDENTIFICATION HAS CHANGED!」が出たとき</h2>
+        <div class="body">
+          <div class="callout warn">同じIPアドレスや同じ外側ポートを別のVM/CTに使い回すと、SSHが以前の接続先と違う相手だと判断して接続を止めることがあります。</div>
+          <p class="note">こういう出力が出ます。</p>
+          <pre><code>root@pve:~# ssh ubuntu@10.10.10.101
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+@    WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED!     @
+@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@
+IT IS POSSIBLE THAT SOMEONE IS DOING SOMETHING NASTY!
+Someone could be eavesdropping on you right now (man-in-the-middle attack)!
+It is also possible that a host key has just been changed.
+The fingerprint for the ED25519 key sent by the remote host is
+SHA256:axUXUdN8i+b4jmQzLonHNolTr1l0RN5eKt3ThXHWkwQ.
+Please contact your system administrator.
+Add correct host key in /root/.ssh/known_hosts to get rid of this message.
+Offending ED25519 key in /root/.ssh/known_hosts:7
+  remove with:
+  ssh-keygen -f '/root/.ssh/known_hosts' -R '10.10.10.101'
+Host key for 10.10.10.101 has changed and you have requested strict checking.
+Host key verification failed.</code></pre>
+          <h3>対処法</h3>
+          <p class="note">PVE上からNAT内IPへSSHしている場合は、PVE本体で古い鍵を消してから、もう一度SSHします。</p>
+          {cmd_block('''ssh-keygen -f /root/.ssh/known_hosts -R 10.10.10.101
+ssh ubuntu@10.10.10.101''')}
+          <p class="note">自分のPCからポート転送経由でSSHしている場合は、自分のPC側で古い鍵を消してから、もう一度SSHします。</p>
+          {cmd_block('''ssh-keygen -R '[172.28.4.147]:2223'
+ssh ubuntu@172.28.4.147 -p 2223''')}
+        </div>
+      </section>
+      <section>
+        <h2>VM/CTを消した後</h2>
+        <div class="body">
+          <p class="note">消えたVM/CTに紐づく転送ルールが残ることがあります。掃除候補は手動で確認してから消します。</p>
+          {cmd_block('''pve-portfw cleanup''')}
+        </div>
+      </section>
+            """,
+        },
+    }
+
+    page_data = pages.get(page, pages["home"])
+    return f"""<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{esc(page_data["title"])} - pve-portfw</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      --bg: #f4f6f8;
+      --panel: #ffffff;
+      --text: #1e2933;
+      --muted: #65758b;
+      --line: #d8e0e8;
+      --accent: #0b6bcb;
+      --warn: #9a6700;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-size: 15px;
+    }}
+    header {{ background: #102a43; color: white; padding: 18px 28px; }}
+    header .titlebar {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; }}
+    header h1 {{ margin: 0; font-size: 22px; letter-spacing: 0; }}
+    header .meta {{ color: #cbd5e1; font-size: 13px; }}
+    nav {{ display: flex; gap: 8px; flex-wrap: wrap; background: #0b1f33; padding: 0 28px 14px; }}
+    nav a {{
+      color: #dbeafe;
+      text-decoration: none;
+      border: 1px solid rgba(219, 234, 254, .35);
+      border-radius: 6px;
+      padding: 7px 12px;
+      font-size: 14px;
+      font-weight: 700;
+    }}
+    nav a.active {{ color: #102a43; background: #ffffff; border-color: #ffffff; }}
+    main {{ padding: 24px 28px 40px; max-width: 1200px; margin: 0 auto; }}
+    .doc-grid {{ display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 18px; }}
+    section {{
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+      box-shadow: 0 1px 2px rgba(15, 23, 42, .04);
+    }}
+    section.wide {{ grid-column: 1 / -1; }}
+    section h2 {{
+      margin: 0;
+      padding: 13px 16px;
+      font-size: 16px;
+      background: #eef4fb;
+      border-bottom: 1px solid var(--line);
+    }}
+    .body {{ padding: 14px 16px; }}
+    .body ul {{ margin: 0; padding-left: 20px; }}
+    .body li {{ margin: 8px 0; }}
+    .settings-table {{
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 0;
+      font-size: 14px;
+    }}
+    .settings-table th,
+    .settings-table td {{
+      border: 1px solid var(--line);
+      padding: 9px 10px;
+      text-align: left;
+      vertical-align: top;
+    }}
+    .settings-table th {{
+      background: #f1f5f9;
+      color: #334155;
+      font-size: 13px;
+    }}
+    .settings-table td:first-child {{
+      width: 170px;
+      font-weight: 700;
+      color: #334155;
+    }}
+    .screenshot-figure {{
+      margin: 0 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+      background: #ffffff;
+    }}
+    .screenshot-figure img {{
+      display: block;
+      width: auto;
+      max-width: 100%;
+      height: auto;
+      background: #f8fafc;
+    }}
+    .screenshot-figure figcaption {{
+      padding: 8px 10px;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.45;
+    }}
+    .wizard-shot {{
+      margin: 0 0 12px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      overflow: hidden;
+      background: #ffffff;
+    }}
+    .wizard-title {{
+      padding: 8px 10px;
+      color: #0b6bcb;
+      font-weight: 700;
+      border-bottom: 1px solid var(--line);
+    }}
+    .wizard-tabs {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 2px;
+      padding: 8px 10px 0;
+      border-bottom: 1px solid var(--line);
+    }}
+    .wizard-tabs span {{
+      padding: 5px 9px;
+      color: #64748b;
+      border-radius: 4px 4px 0 0;
+      font-size: 13px;
+    }}
+    .wizard-tabs span.active {{
+      background: #258bd2;
+      color: #ffffff;
+      font-weight: 700;
+    }}
+    .wizard-body {{
+      display: grid;
+      grid-template-columns: repeat(2, minmax(180px, 1fr));
+      gap: 10px 18px;
+      min-height: 120px;
+      padding: 14px 16px;
+      background: #fbfdff;
+    }}
+    .wizard-row {{
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 10px;
+      align-items: center;
+    }}
+    .wizard-row span {{ color: #64748b; }}
+    .wizard-row strong {{
+      min-height: 30px;
+      padding: 5px 8px;
+      border: 1px solid #cbd5e1;
+      background: #ffffff;
+      font-weight: 600;
+    }}
+    .note {{ color: var(--muted); margin-top: 8px; line-height: 1.55; }}
+    .callout {{
+      border-left: 4px solid var(--accent);
+      background: #eef6ff;
+      padding: 12px 14px;
+      margin: 0 0 12px;
+      border-radius: 0 6px 6px 0;
+    }}
+    .warn {{ border-left-color: var(--warn); background: #fff7e6; }}
+    code {{
+      font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+      background: #eef2f7;
+      padding: 2px 5px;
+      border-radius: 4px;
+    }}
+    pre {{
+      margin: 10px 0 0;
+      padding: 12px;
+      overflow-x: auto;
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 6px;
+      line-height: 1.45;
+    }}
+    pre code {{ background: transparent; color: inherit; padding: 0; }}
+    pre code .code-hl {{
+      display: inline-block;
+      background: #fde68a;
+      color: #111827;
+      border: 1px solid #f59e0b;
+      border-radius: 4px;
+      padding: 0 4px;
+      font-weight: 800;
+    }}
+    .cmd-block {{
+      position: relative;
+      margin-top: 8px;
+    }}
+    .cmd-block + .cmd-block {{ margin-top: 8px; }}
+    .cmd-block pre {{
+      margin: 0;
+      padding: 11px 78px 11px 12px;
+      border: 1px solid #263248;
+    }}
+    .config-block pre {{ padding-top: 12px; }}
+    .copy-btn {{
+      position: absolute;
+      top: 7px;
+      right: 7px;
+      border: 1px solid rgba(226, 232, 240, .45);
+      background: #1f2937;
+      color: #e5e7eb;
+      border-radius: 5px;
+      padding: 3px 8px;
+      font-size: 12px;
+      font-weight: 700;
+      line-height: 1.4;
+      cursor: pointer;
+    }}
+    .copy-btn:hover {{ background: #334155; }}
+    .copy-btn:active {{ transform: translateY(1px); }}
+    @media (max-width: 900px) {{
+      .doc-grid {{ grid-template-columns: 1fr; }}
+      main {{ padding: 18px; }}
+      header .titlebar {{ align-items: flex-start; flex-direction: column; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="titlebar">
+      <h1>{esc(page_data["title"])}</h1>
+      <div class="meta">読み取り専用 / 最終生成 {esc(generated_at)}</div>
+    </div>
+  </header>
+  <nav>
+    {nav_html(page_data["path"])}
+  </nav>
+  <main>
+    <div class="doc-grid">
+      {page_data["body"]}
+    </div>
+  </main>
+  <script>
+    function fallbackCopy(text) {{
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.setAttribute("readonly", "");
+      area.style.position = "fixed";
+      area.style.left = "-9999px";
+      document.body.appendChild(area);
+      area.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(area);
+      if (!ok) throw new Error("copy failed");
+    }}
+
+    document.querySelectorAll(".copy-btn").forEach(button => {{
+      button.addEventListener("click", async () => {{
+        const code = button.closest(".cmd-block").querySelector("code").innerText;
+        const oldText = button.textContent;
+        try {{
+          if (navigator.clipboard && window.isSecureContext) {{
+            await navigator.clipboard.writeText(code);
+          }} else {{
+            fallbackCopy(code);
+          }}
+          button.textContent = "コピー済み";
+          setTimeout(() => {{ button.textContent = oldText; }}, 1200);
+        }} catch (error) {{
+          button.textContent = "失敗";
+          setTimeout(() => {{ button.textContent = oldText; }}, 1200);
+        }}
+      }});
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "pve-portfw-web/1.0"
+
+    def log_message(self, fmt, *args):
+        print("%s - - [%s] %s" % (self.client_address[0], self.log_date_time_string(), fmt % args))
+
+    def send_bytes(self, content, content_type, status=200):
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(content)
+
+    def send_static(self, path):
+        rel = path[len("/static/") :]
+        parts = [part for part in rel.split("/") if part]
+        if not parts or any(part in {".", ".."} or "\\" in part for part in parts):
+            self.send_bytes("見つかりません\n".encode("utf-8"), "text/plain; charset=utf-8", status=404)
+            return
+        root = os.path.realpath(STATIC_DIR)
+        target = os.path.realpath(os.path.join(root, *parts))
+        if target != root and not target.startswith(root + os.sep):
+            self.send_bytes("見つかりません\n".encode("utf-8"), "text/plain; charset=utf-8", status=404)
+            return
+        content_types = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".svg": "image/svg+xml",
+        }
+        content_type = content_types.get(os.path.splitext(target)[1].lower())
+        if not content_type:
+            self.send_bytes("見つかりません\n".encode("utf-8"), "text/plain; charset=utf-8", status=404)
+            return
+        try:
+            with open(target, "rb") as handle:
+                content = handle.read()
+        except FileNotFoundError:
+            self.send_bytes("見つかりません\n".encode("utf-8"), "text/plain; charset=utf-8", status=404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(content)))
+        self.send_header("Cache-Control", "no-store, max-age=0")
+        self.end_headers()
+        self.wfile.write(content)
+
+    def stream_events(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        previous_payload = ""
+        while True:
+            try:
+                payload = json.dumps(status_for_response(), ensure_ascii=False, separators=(",", ":"))
+                if payload != previous_payload:
+                    self.wfile.write(f"data: {payload}\n\n".encode("utf-8"))
+                    previous_payload = payload
+                else:
+                    self.wfile.write(b": keepalive\n\n")
+                self.wfile.flush()
+                time.sleep(STATUS_REFRESH_SECONDS)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+    def do_GET(self):
+        path = urlparse(self.path).path
+        if path == "/healthz":
+            self.send_bytes(b"ok\n", "text/plain; charset=utf-8")
+            return
+        if path.startswith("/static/"):
+            self.send_static(path)
+            return
+        if path == "/events":
+            self.stream_events()
+            return
+        doc_routes = {
+            "/": "home",
+            "/index.html": "home",
+            "/help": "vmct",
+            "/help.html": "vmct",
+            "/vmct": "vmct",
+            "/create": "create-vm",
+            "/create-vm": "create-vm",
+            "/create-ct": "create-ct",
+            "/network": "network",
+            "/portfw": "portfw",
+            "/trouble": "trouble",
+            "/tips": "trouble",
+        }
+        if path in doc_routes:
+            self.send_bytes(render_doc_html(doc_routes[path]).encode("utf-8"), "text/html; charset=utf-8")
+            return
+        if path == "/api/status":
+            status = status_for_response()
+            content = json.dumps(status, ensure_ascii=False, indent=2).encode("utf-8")
+            self.send_bytes(content, "application/json; charset=utf-8")
+            return
+        if path in {"/status", "/status.html"}:
+            self.send_bytes(render_html(status_for_response()).encode("utf-8"), "text/html; charset=utf-8")
+            return
+        self.send_bytes("見つかりません\n".encode("utf-8"), "text/plain; charset=utf-8", status=404)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="読み取り専用 pve-portfw Webダッシュボード")
+    parser.add_argument("--host", default=os.environ.get("PVE_PORTFW_WEB_HOST", "172.28.4.147"))
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PVE_PORTFW_WEB_PORT", "9090")))
+    args = parser.parse_args()
+    refresh_status_cache()
+    start_status_refresher()
+    server = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"pve-portfw Webダッシュボードを http://{args.host}:{args.port}/ で起動しました")
+    server.serve_forever()
+
+
+if __name__ == "__main__":
+    main()

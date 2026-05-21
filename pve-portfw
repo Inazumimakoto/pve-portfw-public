@@ -1,0 +1,1306 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+DATA_DIR=${PVE_PORTFW_DIR:-/etc/pve-portfw}
+VMS_FILE="$DATA_DIR/vms.tsv"
+RULES_FILE="$DATA_DIR/rules.tsv"
+EXT_IF=${PVE_PORTFW_EXT_IF:-vmbr0}
+INT_IF=${PVE_PORTFW_INT_IF:-vmbr1}
+DNAT_CHAIN=${PVE_PORTFW_DNAT_CHAIN:-PVEPORTFW_DNAT}
+FWD_CHAIN=${PVE_PORTFW_FWD_CHAIN:-PVEPORTFW_FWD}
+NAT_CIDR=${PVE_PORTFW_NAT_CIDR:-10.10.10.0/24}
+
+declare -A GUEST_KIND_CACHE=()
+declare -A GUEST_STATUS_CACHE=()
+GUEST_CACHE_LOADED=0
+
+log() { printf '%s\n' "$*"; }
+color_stderr() {
+  [[ -z "${NO_COLOR:-}" ]] && { [[ -t 2 ]] || [[ "${PVE_PORTFW_COLOR:-auto}" == "always" ]]; }
+}
+warn() {
+  if color_stderr; then
+    printf '\033[33m警告: %s\033[0m\n' "$*" >&2
+  else
+    printf '警告: %s\n' "$*" >&2
+  fi
+}
+die() { printf 'エラー: %s\n' "$*" >&2; exit 1; }
+
+ja_kind() {
+  case "${1:-}" in
+    vm) printf 'VM' ;;
+    ct) printf 'CT' ;;
+    missing) printf '不明' ;;
+    *) printf '%s' "${1:-}" ;;
+  esac
+}
+
+ja_status() {
+  case "${1:-}" in
+    OK) printf '正常' ;;
+    MISSING|missing) printf '削除済み' ;;
+    UNREGISTERED) printf '未登録' ;;
+    DETECTED) printf '検出済み' ;;
+    MISMATCH) printf '不一致' ;;
+    NO-IP) printf '未検出' ;;
+    STOPPED|stopped) printf '停止中' ;;
+    running) printf '実行中' ;;
+    CHECK) printf '確認' ;;
+    *) printf '%s' "${1:-}" ;;
+  esac
+}
+
+ipt() { iptables -w "$@"; }
+
+rule() {
+  printf '%*s\n' "${1:-86}" '' | tr ' ' '-'
+}
+
+title() {
+  local text=$1 width=${2:-86}
+  rule "$width"
+  printf '%s\n' "$text"
+  rule "$width"
+}
+
+table() {
+  python3 -c '
+import sys
+import unicodedata
+
+rows = [line.rstrip("\n").split("\t") for line in sys.stdin if line.rstrip("\n")]
+if not rows:
+    sys.exit(0)
+
+cols = max(len(row) for row in rows)
+for row in rows:
+    row.extend([""] * (cols - len(row)))
+
+def cell_width(text):
+    width = 0
+    for ch in str(text):
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in {"F", "W"} else 1
+    return width
+
+widths = [max(cell_width(row[index]) for row in rows) for index in range(cols)]
+
+def pad(text, width):
+    text = str(text)
+    return text + (" " * (width - cell_width(text)))
+
+for row_index, row in enumerate(rows):
+    print("  " + "  ".join(pad(row[index], widths[index]) for index in range(cols)).rstrip())
+    if row_index == 0:
+        print("  " + "  ".join("-" * widths[index] for index in range(cols)).rstrip())
+'
+}
+
+require_root() {
+  [[ ${EUID:-$(id -u)} -eq 0 ]] || die "rootで実行してください"
+}
+
+ensure_data() {
+  install -d -m 0755 "$DATA_DIR"
+  if [[ ! -f "$VMS_FILE" ]]; then
+    printf '# vmid\tname\tnat_ip\n' > "$VMS_FILE"
+    chmod 0644 "$VMS_FILE"
+  fi
+  if [[ ! -f "$RULES_FILE" ]]; then
+    printf '# id\tvmid\tname\tproto\texternal_port\tvm_ip\tvm_port\tcomment\n' > "$RULES_FILE"
+    chmod 0644 "$RULES_FILE"
+  fi
+  normalize_rule_ids
+}
+
+normalize_rule_ids() {
+  [[ -f "$RULES_FILE" ]] || return 0
+  local tmp
+  tmp=$(mktemp)
+  awk -F '\t' '
+    BEGIN { OFS=FS; next_id=1 }
+    /^#/ || NF==0 { print; next }
+    $1 ~ /^[0-9]+$/ { used[$1]=1; print; next }
+    {
+      while (used[next_id]) next_id++
+      $1=next_id
+      used[$1]=1
+      print
+    }
+  ' "$RULES_FILE" > "$tmp"
+  if cmp -s "$tmp" "$RULES_FILE"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$RULES_FILE"
+    chmod 0644 "$RULES_FILE"
+  fi
+}
+
+usage() {
+  cat <<EOF
+使い方: pve-portfw [command]
+
+コマンド:
+  menu             対話式でポート転送を追加します（デフォルト）
+  manage           管理メニューを開きます
+  register-vm      VM/CT の NAT IP を登録または更新します
+  sync             検出できた未登録 VM/CT の NAT IP を自動登録します
+  refresh          新規 VM/CT の登録と、安全に消せる古い台帳行の掃除を行います
+  add              ポート転送ルールを追加します
+  ports            Proxmox 側で使用中の外側ポートを表示します
+  list             VM/CT 台帳とポート転送ルールを表示します
+  delete           ポート転送ルールを削除します
+  apply            台帳のルールを iptables に反映します
+  flush            pve-portfw 管理下の iptables チェーン/接続だけ削除します
+  cleanup          削除済み VM/CT に紐づく転送ルールを削除します
+  scan             vmbr1 の ARP/neighbor 情報から NAT IP を検出します
+  doctor           vmbr1、IP転送、NAT、管理外ルールを確認します
+  help             ヘルプを表示します
+
+非対話でも使えます:
+  pve-portfw register-vm <ID> <NAT-IP> [--force]
+  pve-portfw add <ID> <外側ポート> <VM側ポート> [tcp|udp] [メモ...]
+  pve-portfw delete <ルールID>
+EOF
+}
+
+cmd_help() {
+  cat <<'EOF'
+pve-portfw help
+
+これは Proxmox の NAT 配下 VM/CT へポート転送を作るための補助ツールです。
+台帳は /etc/pve-portfw/vms.tsv と /etc/pve-portfw/rules.tsv に保存されます。
+
+よく使う流れ:
+  1. pve-portfw
+  2. 番号で VM/CT を選ぶ
+  3. Proxmox 側の外側ポートを入力する
+  4. VM/CT 内部のポートを入力する
+  5. メモを入力する
+
+通常メニュー:
+  番号    VM/CT を選んでポート転送を追加します。
+  n       VM/CT を手動登録します。自動検出できない場合に使います。
+  r       VM/CT 台帳を更新します。新規VM/CTの自動登録と安全な古い行の削除を行います。
+  l       VM/CT 台帳とポート転送ルールを表示します。
+  d       ポート転送ルールを削除します。
+  c       削除済み VM/CT に紐づく転送ルールを掃除します。
+  i       NAT IP の検出状態を表示します。登録IPと検出IPのズレ確認に使います。
+  h       ヘルプを表示します。
+  q       終了します。
+
+主要コマンド:
+  pve-portfw list
+      VM/CT 台帳とポート転送ルールを表示します。
+
+  pve-portfw refresh
+      新規 VM/CT を自動検出して登録します。
+      消えた VM/CT は、転送ルールが残っていない場合だけ台帳から削除します。
+
+  pve-portfw scan
+      vmbr1 内の IP と MAC を照合して、VM/CT の検出IPを表示します。
+
+  pve-portfw add <ID> <Proxmox側ポート> <VM側ポート> [tcp|udp] [メモ]
+      非対話でポート転送を追加します。
+      例: pve-portfw add 100 2222 22 tcp ssh
+
+  pve-portfw delete
+      対話式で転送ルールを削除します。
+
+  pve-portfw cleanup
+      削除済み VM/CT に紐づく転送ルールを削除します。
+
+  pve-portfw ports
+      Proxmox 側で使用中の外側ポートを表示します。
+
+  pve-portfw doctor
+      NAT、iptables、systemdサービスなどの状態を確認します。
+
+安全ルール:
+  - Proxmox 側ポートが使用済みなら、VM側ポートを聞く前に拒否します。
+  - VM側 TCP ポートが閉じていそうな場合は黄色の警告を出しますが、追加は続行します。
+  - 登録済みIPと検出IPが違う場合は「不一致」と表示し、勝手には直しません。
+  - VM/CT が削除されても、転送ルールが残っているものは勝手に消しません。
+
+Web画面:
+  http://172.28.4.147:9090/
+EOF
+}
+
+sanitize_field() {
+  printf '%s' "$*" | tr '\t\r\n' '   ' | sed 's/^ *//; s/ *$//'
+}
+
+valid_port() {
+  [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
+}
+
+valid_proto() {
+  [[ "$1" == tcp || "$1" == udp ]]
+}
+
+valid_ipv4() {
+  local ip=$1 IFS=. parts
+  [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+  read -r -a parts <<< "$ip"
+  [[ ${#parts[@]} -eq 4 ]] || return 1
+  local p
+  for p in "${parts[@]}"; do
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    (( p >= 0 && p <= 255 )) || return 1
+  done
+}
+
+ip_in_cidr() {
+  python3 - "$1" "$2" <<'PY'
+import ipaddress
+import sys
+
+try:
+    ip = ipaddress.ip_address(sys.argv[1])
+    network = ipaddress.ip_network(sys.argv[2], strict=False)
+except ValueError:
+    sys.exit(1)
+sys.exit(0 if ip in network else 1)
+PY
+}
+
+int_if_ipv4() {
+  ip -o -4 addr show "$INT_IF" 2>/dev/null | awk 'NR==1 {sub(/\/.*/, "", $4); print $4}'
+}
+
+ext_if_ipv4() {
+  ip -o -4 addr show "$EXT_IF" 2>/dev/null | awk 'NR==1 {sub(/\/.*/, "", $4); print $4}'
+}
+
+guest_macs_from_config() {
+  local id=$1
+  { qm config "$id" 2>/dev/null || true; pct config "$id" 2>/dev/null || true; } |
+    sed -nE 's/.*([0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){5}).*/\1/p' |
+    tr 'A-F' 'a-f' |
+    sort -u
+}
+
+neighbor_mac_for_ip() {
+  local ip=$1
+  ip neigh show "$ip" dev "$INT_IF" 2>/dev/null |
+    awk '{
+      for (i = 1; i <= NF; i++) {
+        if ($i == "lladdr") {
+          print tolower($(i + 1))
+          exit
+        }
+      }
+    }'
+}
+
+probe_nat_network() {
+  local jobs=() ip
+  while read -r ip; do
+    ping -c 1 -W 1 "$ip" >/dev/null 2>&1 &
+    jobs+=("$!")
+    if ((${#jobs[@]} >= 64)); then
+      wait "${jobs[@]}" 2>/dev/null || true
+      jobs=()
+    fi
+  done < <(python3 - "$NAT_CIDR" "$(int_if_ipv4)" <<'PY'
+import ipaddress
+import sys
+
+network = ipaddress.ip_network(sys.argv[1], strict=False)
+gateway = sys.argv[2]
+for ip in network.hosts():
+    text = str(ip)
+    if text == gateway:
+        continue
+    print(text)
+PY
+)
+  ((${#jobs[@]} == 0)) || wait "${jobs[@]}" 2>/dev/null || true
+}
+
+detected_ips_for_id() {
+  local id=$1 macs mac ip
+  macs=$(guest_macs_from_config "$id")
+  [[ -n "$macs" ]] || return 0
+  while read -r mac; do
+    [[ -z "$mac" ]] && continue
+    ip neigh show dev "$INT_IF" 2>/dev/null |
+      awk -v mac="$mac" 'tolower($0) ~ mac && $1 ~ /^[0-9]+\./ {print $1}'
+  done <<< "$macs" | sort -u | paste -sd, -
+}
+
+validate_nat_ip_for_guest() {
+  local id=$1 ip=$2 force=${3:-0} gateway macs seen_mac
+  ip_in_cidr "$ip" "$NAT_CIDR" || die "NAT IP $ip は $NAT_CIDR の範囲内にしてください"
+
+  gateway=$(int_if_ipv4)
+  if [[ -n "$gateway" && "$ip" == "$gateway" ]]; then
+    die "NAT IP $ip は $INT_IF のゲートウェイ用なので使えません"
+  fi
+
+  [[ "$force" == 1 ]] && return 0
+
+  if ! ping -c 1 -W 1 "$ip" >/dev/null 2>&1; then
+    die "NAT IP $ip に Proxmox から到達できません。VM/CTを起動してIP設定を確認してください。疎通確認を飛ばす場合は --force を使えます。"
+  fi
+
+  seen_mac=$(neighbor_mac_for_ip "$ip")
+  if [[ -z "$seen_mac" ]]; then
+    die "NAT IP $ip は応答しましたが、ARPテーブルでMACアドレスを確認できませんでした。もう一度試すか、--force で疎通確認を飛ばしてください。"
+  fi
+
+  macs=$(guest_macs_from_config "$id")
+  if [[ -n "$macs" ]] && ! grep -qi "^$seen_mac$" <<< "$macs"; then
+    die "NAT IP $ip は MAC $seen_mac の端末です。ID $id のMACは $(tr '\n' ' ' <<< "$macs") なので一致しません"
+  fi
+}
+
+load_guest_cache() {
+  [[ "$GUEST_CACHE_LOADED" == 1 ]] && return 0
+  GUEST_KIND_CACHE=()
+  GUEST_STATUS_CACHE=()
+  local id status
+  while read -r id status; do
+    [[ -z "${id:-}" ]] && continue
+    GUEST_KIND_CACHE["$id"]=vm
+    GUEST_STATUS_CACHE["$id"]="$status"
+  done < <(qm list 2>/dev/null | awk 'NR>1 {print $1, $3}')
+  while read -r id status; do
+    [[ -z "${id:-}" ]] && continue
+    GUEST_KIND_CACHE["$id"]=ct
+    GUEST_STATUS_CACHE["$id"]="$status"
+  done < <(pct list 2>/dev/null | awk 'NR>1 {print $1, $2}')
+  GUEST_CACHE_LOADED=1
+}
+
+refresh_guest_cache() {
+  GUEST_CACHE_LOADED=0
+  load_guest_cache
+}
+
+vm_exists() {
+  load_guest_cache
+  [[ -n "${GUEST_KIND_CACHE[$1]+x}" ]]
+}
+
+guest_kind() {
+  load_guest_cache
+  printf '%s' "${GUEST_KIND_CACHE[$1]:-missing}"
+}
+
+vm_name_from_qm() {
+  local vmid=$1 name
+  name=$(qm config "$vmid" 2>/dev/null | awk -F': ' '/^name:/{print $2; exit}') || true
+  if [[ -z "${name:-}" ]]; then
+    name=$(pct config "$vmid" 2>/dev/null | awk -F': ' '/^hostname:/{print $2; exit}') || true
+  fi
+  if [[ -z "${name:-}" ]]; then
+    name=$(qm list 2>/dev/null | awk -v id="$vmid" 'NR>1 && $1==id {print $2; exit}') || true
+  fi
+  if [[ -z "${name:-}" ]]; then
+    name=$(pct list 2>/dev/null | awk -v id="$vmid" 'NR>1 && $1==id {print $NF; exit}') || true
+  fi
+  printf '%s' "${name:-item-$vmid}"
+}
+
+vm_bridges_from_qm() {
+  local vmid=$1
+  { qm config "$vmid" 2>/dev/null || true; pct config "$vmid" 2>/dev/null || true; } |
+    awk -F'[:,]' '/^net[0-9]+:/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^bridge=/) {
+          sub(/^bridge=/, "", $i)
+          print $i
+        }
+      }
+    }' |
+    sort -u |
+    paste -sd, -
+}
+
+vm_has_nat_bridge() {
+  local vmid=$1 bridges
+  bridges=$(vm_bridges_from_qm "$vmid")
+  [[ ",$bridges," == *",$INT_IF,"* ]]
+}
+
+get_vm_record() {
+  local vmid=$1 line id name ip
+  while IFS=$'\t' read -r id name ip _; do
+    [[ -z "${id:-}" || "${id:0:1}" == '#' ]] && continue
+    if [[ "$id" == "$vmid" ]]; then
+      printf '%s\t%s\t%s\n' "$id" "$name" "$ip"
+      return 0
+    fi
+  done < "$VMS_FILE"
+  return 1
+}
+
+registered_vm_lines() {
+  while IFS=$'\t' read -r vmid name ip _; do
+    [[ -z "${vmid:-}" || "${vmid:0:1}" == '#' ]] && continue
+    printf '%s\t%s\t%s\n' "$vmid" "$name" "$ip"
+  done < "$VMS_FILE" | sort -n -k1,1
+}
+
+rule_lines() {
+  while IFS=$'\t' read -r rid vmid name proto ext vmip vmport comment extra; do
+    [[ -z "${rid:-}" || "${rid:0:1}" == '#' ]] && continue
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rid" "$vmid" "$name" "$proto" "$ext" "$vmip" "$vmport" "${comment:-}"
+  done < "$RULES_FILE"
+}
+
+unregistered_nat_guest_ids() {
+  load_guest_cache
+  local id
+  for id in "${!GUEST_KIND_CACHE[@]}"; do
+    get_vm_record "$id" >/dev/null 2>&1 && continue
+    vm_has_nat_bridge "$id" || continue
+    printf '%s\n' "$id"
+  done | sort -n
+}
+
+show_unregistered_hint() {
+  local ids=() joined
+  mapfile -t ids < <(unregistered_nat_guest_ids)
+  ((${#ids[@]} > 0)) || return 0
+  joined=$(IFS=,; printf '%s' "${ids[*]}")
+  printf '未登録の VM/CT があります（ID: %s）。r で更新できます。\n' "$joined" >&2
+}
+
+choose_vm() {
+  mapfile -t rows < <(registered_vm_lines)
+  ((${#rows[@]} > 0)) || die "登録済みの VM/CT がありません。pve-portfw register-vm を実行してください"
+  printf '登録済み VM/CT:\n' >&2
+  local i row vmid name ip status kind
+  {
+    printf '番号\t種別\tID\t名前\tNAT IP\t状態\n'
+    for i in "${!rows[@]}"; do
+      IFS=$'\t' read -r vmid name ip <<< "${rows[$i]}"
+      status=OK
+      vm_exists "$vmid" || status=MISSING
+      kind=$(guest_kind "$vmid")
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$((i+1))" "$(ja_kind "$kind")" "$vmid" "$name" "$ip" "$(ja_status "$status")"
+    done
+  } | table >&2
+  local sel
+  read -r -p 'VM/CT番号を選択: ' sel
+  [[ "$sel" =~ ^[0-9]+$ ]] || die "選択が正しくありません"
+  (( sel >= 1 && sel <= ${#rows[@]} )) || die "選択範囲外です"
+  printf '%s\n' "${rows[$((sel-1))]}"
+}
+
+choose_or_register_vm() {
+  while true; do
+    refresh_guest_cache
+    mapfile -t rows < <(registered_vm_lines)
+    printf '\n' >&2
+    title "どの VM/CT にポート転送しますか？" >&2
+    if ((${#rows[@]} > 0)); then
+      local i row vmid name ip status kind
+      {
+        printf '番号\t種別\tID\t名前\tNAT IP\t状態\n'
+        for i in "${!rows[@]}"; do
+          IFS=$'\t' read -r vmid name ip <<< "${rows[$i]}"
+          status=OK
+          vm_exists "$vmid" || status=MISSING
+          kind=$(guest_kind "$vmid")
+          printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$((i+1))" "$(ja_kind "$kind")" "$vmid" "$name" "$ip" "$(ja_status "$status")"
+        done
+      } | table >&2
+    else
+      printf '  （登録済みの VM/CT はまだありません）\n' >&2
+    fi
+    show_unregistered_hint
+    cat >&2 <<EOF
+--------------------------------------------------------------------------------
+  番号    VM/CT を選んでポート転送を追加
+  n       VM/CT を手動登録
+  r       VM/CT 台帳を更新（自動検出と古い行の掃除）
+  l       台帳とポート転送ルールを表示
+  d       ポート転送ルールを削除
+  c       削除済み VM/CT に紐づくルールを掃除
+  i       NAT IP の検出状態を表示
+  h       ヘルプを表示
+  q       終了
+--------------------------------------------------------------------------------
+EOF
+    local sel
+    read -r -p '選択: ' sel
+    case "$sel" in
+      n|N|new)
+        cmd_register_vm >&2
+        continue
+        ;;
+      r|R|refresh|a|A|auto|sync)
+        cmd_refresh >&2
+        continue
+        ;;
+      l|L|list)
+        cmd_list >&2
+        continue
+        ;;
+      d|D|delete)
+        cmd_delete >&2
+        continue
+        ;;
+      c|C|cleanup)
+        cmd_cleanup >&2
+        continue
+        ;;
+      i|I|ip|scan|s|S)
+        cmd_scan >&2
+        continue
+        ;;
+      h|H|help|\?)
+        cmd_help >&2
+        continue
+        ;;
+      q|Q|quit|exit)
+        return 1
+        ;;
+      *)
+        if [[ "$sel" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel <= ${#rows[@]} )); then
+          printf '%s\n' "${rows[$((sel-1))]}"
+          return 0
+        fi
+        warn "選択肢がわかりません"
+        ;;
+    esac
+  done
+}
+
+choose_qm_vm() {
+  mapfile -t rows < <(
+    qm list 2>/dev/null | awk 'NR>1 {printf "vm\t%s\t%s\t%s\n", $1, $2, $3}'
+    pct list 2>/dev/null | awk 'NR>1 {printf "ct\t%s\t%s\t%s\n", $1, $NF, $2}'
+  )
+  ((${#rows[@]} > 0)) || die "Proxmox 上に VM/CT がありません"
+  printf 'Proxmox 上の VM/CT:\n' >&2
+  local i kind vmid name status bridges network
+  {
+    printf '番号\t種別\tID\t名前\t状態\tネットワーク\n'
+    for i in "${!rows[@]}"; do
+      IFS=$'\t' read -r kind vmid name status <<< "${rows[$i]}"
+      bridges=$(vm_bridges_from_qm "$vmid")
+      network=${bridges:-なし}
+      if [[ ",$bridges," == *",$INT_IF,"* ]]; then
+        network="$bridges NAT"
+      elif [[ ",$bridges," == *",$EXT_IF,"* ]]; then
+        network="$bridges ブリッジ"
+      fi
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$((i+1))" "$(ja_kind "$kind")" "$vmid" "$name" "$(ja_status "$status")" "$network"
+    done
+  } | table >&2
+  local sel
+  read -r -p 'VM/CT番号を選択（qで中止）: ' sel
+  case "$sel" in
+    q|Q|quit|exit) return 1 ;;
+  esac
+  [[ "$sel" =~ ^[0-9]+$ ]] || die "選択が正しくありません"
+  (( sel >= 1 && sel <= ${#rows[@]} )) || die "選択範囲外です"
+  local selected
+  selected=${rows[$((sel-1))]}
+  IFS=$'\t' read -r _ vmid name status <<< "$selected"
+  printf '%s\t%s\t%s\n' "$vmid" "$name" "$status"
+}
+
+register_vm_record() {
+  local vmid=$1 ip=$2 force=${3:-0} name tmp existing_vmid existing_name existing_ip
+  [[ "$vmid" =~ ^[0-9]+$ ]] || die "VM/CT ID が正しくありません: $vmid"
+  valid_ipv4 "$ip" || die "IPv4アドレスが正しくありません: $ip"
+  vm_exists "$vmid" || die "VM/CT ID $vmid は存在しません"
+  vm_has_nat_bridge "$vmid" || die "ID $vmid は $INT_IF に接続されていません。pve-portfw は NAT 側の VM/CT だけを管理します"
+  validate_nat_ip_for_guest "$vmid" "$ip" "$force"
+  while IFS=$'\t' read -r existing_vmid existing_name existing_ip _; do
+    [[ -z "${existing_vmid:-}" || "${existing_vmid:0:1}" == '#' ]] && continue
+    if [[ "$existing_ip" == "$ip" && "$existing_vmid" != "$vmid" ]]; then
+      die "NAT IP $ip はすでに VM/CT ID $existing_vmid ($existing_name) に登録されています"
+    fi
+  done < "$VMS_FILE"
+  name=$(sanitize_field "$(vm_name_from_qm "$vmid")")
+  tmp=$(mktemp)
+  awk -F '\t' -v id="$vmid" 'BEGIN{OFS=FS} /^#/ || NF==0 {print; next} $1 != id {print}' "$VMS_FILE" > "$tmp"
+  printf '%s\t%s\t%s\n' "$vmid" "$name" "$ip" >> "$tmp"
+  mv "$tmp" "$VMS_FILE"
+  chmod 0644 "$VMS_FILE"
+  log "登録しました: ID=$vmid 名前=$name NAT_IP=$ip"
+}
+
+auto_register_detected() {
+  ensure_data
+  [[ "${PVE_PORTFW_AUTO_REGISTER:-1}" == 1 ]] || return 0
+  refresh_guest_cache
+
+  local mode=${1:-normal} rows=() candidates=() row kind id name status bridges detected record output changes=0
+
+  mapfile -t rows < <(
+    qm list 2>/dev/null | awk 'NR>1 {printf "vm\t%s\t%s\t%s\n", $1, $2, $3}'
+    pct list 2>/dev/null | awk 'NR>1 {printf "ct\t%s\t%s\t%s\n", $1, $NF, $2}'
+  )
+
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r kind id name status <<< "$row"
+    get_vm_record "$id" >/dev/null 2>&1 && continue
+    bridges=$(vm_bridges_from_qm "$id")
+    [[ ",$bridges," == *",$INT_IF,"* ]] || continue
+    candidates+=("$row")
+  done
+
+  if ((${#candidates[@]} == 0)); then
+    [[ "$mode" == quiet ]] || log "$INT_IF に接続された未登録 VM/CT はありません"
+    return 0
+  fi
+
+  [[ "$mode" == quiet ]] || printf '%s 上の未登録 VM/CT の NAT IPv4 を検出しています...\n' "$INT_IF" >&2
+  probe_nat_network
+
+  for row in "${candidates[@]}"; do
+    IFS=$'\t' read -r kind id name status <<< "$row"
+    detected=$(detected_ips_for_id "$id")
+    [[ -n "$detected" ]] || continue
+    if [[ "$detected" == *,* ]]; then
+      warn "ID=$id ($name) は自動登録をスキップします。複数のIPを検出しました: $detected"
+      continue
+    fi
+    if output=$(register_vm_record "$id" "$detected" 2>&1); then
+      [[ -n "$output" && "$mode" != quiet ]] && printf '%s\n' "$output"
+      changes=$((changes + 1))
+    else
+      warn "ID=$id ($name) は自動登録をスキップします: $output"
+    fi
+  done
+
+  if ((changes == 0)) && [[ "$mode" != quiet ]]; then
+    log "新しく自動登録された VM/CT はありません"
+  fi
+}
+
+cmd_register_vm() {
+  ensure_data
+  if (($# >= 2)); then
+    local force=0
+    [[ "${3:-}" == "--force" ]] && force=1
+    register_vm_record "$1" "$2" "$force"
+    return
+  fi
+  local row vmid name status ip detected answer
+  if ! row=$(choose_qm_vm); then
+    return 0
+  fi
+  IFS=$'\t' read -r vmid name status <<< "$row"
+  detected=$(detected_ips_for_id "$vmid")
+  if [[ -n "$detected" ]]; then
+    if [[ "$detected" == *,* ]]; then
+      printf '複数の候補を検出しました: %s\n' "$detected" >&2
+    else
+      read -r -p "$detected を検出しました。このIPを使いますか？ [Y/n]: " answer
+      if [[ -z "$answer" || "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]]; then
+        ip="$detected"
+      fi
+    fi
+  else
+    printf 'ID %s の NAT IPv4 は未検出です。自動検出する場合は r で更新してください。\n' "$vmid" >&2
+  fi
+  if [[ -z "${ip:-}" ]]; then
+    read -r -p "ID $vmid ($name) の NAT IPv4（例: 10.10.10.20）: " ip
+  fi
+  register_vm_record "$vmid" "$ip"
+}
+
+ensure_chains() {
+  ipt -t nat -N "$DNAT_CHAIN" 2>/dev/null || true
+  ipt -N "$FWD_CHAIN" 2>/dev/null || true
+  while ipt -t nat -C PREROUTING -i "$EXT_IF" -j "$DNAT_CHAIN" 2>/dev/null; do
+    ipt -t nat -D PREROUTING -i "$EXT_IF" -j "$DNAT_CHAIN"
+  done
+  ipt -t nat -A PREROUTING -i "$EXT_IF" -j "$DNAT_CHAIN"
+  while ipt -C FORWARD -j "$FWD_CHAIN" 2>/dev/null; do
+    ipt -D FORWARD -j "$FWD_CHAIN"
+  done
+  ipt -A FORWARD -j "$FWD_CHAIN"
+}
+
+reserved_external_port() {
+  case "$1" in
+    22|8006) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+rule_conflicts() {
+  local proto=$1 ext=$2 except_id=${3:-} rid vmid name rproto rext vmip vmport comment
+  while IFS=$'\t' read -r rid vmid name rproto rext vmip vmport comment; do
+    [[ -z "${rid:-}" || "${rid:0:1}" == '#' ]] && continue
+    [[ -n "$except_id" && "$rid" == "$except_id" ]] && continue
+    if [[ "$rproto" == "$proto" && "$rext" == "$ext" ]]; then
+      printf '%s' "$rid"
+      return 0
+    fi
+  done < "$RULES_FILE"
+  return 1
+}
+
+local_listener_for_port() {
+  local proto=$1 port=$2 flag ext_ip
+  case "$proto" in
+    tcp) flag=t ;;
+    udp) flag=u ;;
+    *) return 1 ;;
+  esac
+  ext_ip=$(ext_if_ipv4)
+  ss -H -ln"$flag" 2>/dev/null |
+    awk -v port="$port" -v ext="$ext_ip" '
+      function hostpart(value, tmp) {
+        if (value ~ /^\[.*\]:[0-9]+$/) {
+          tmp=value
+          sub(/^\[/, "", tmp)
+          sub(/\]:[0-9]+$/, "", tmp)
+          return tmp
+        }
+        sub(":" port "$", "", value)
+        return value
+      }
+      $4 ~ ":" port "$" {
+        host=hostpart($4)
+        if (host == "*" || host == "0.0.0.0" || host == "::" || host == ext) {
+          print
+          found=1
+          exit
+        }
+      }
+      END {exit found ? 0 : 1}
+    '
+}
+
+unmanaged_dnat_for_port() {
+  local proto=$1 port=$2
+  iptables -t nat -S PREROUTING 2>/dev/null |
+    awk -v proto="$proto" -v port="$port" -v chain="$DNAT_CHAIN" '
+      $0 ~ "-p " proto && $0 ~ "--dport " port "([^0-9]|$)" && $0 !~ chain { print; found=1; exit }
+      END { exit found ? 0 : 1 }
+    '
+}
+
+vm_tcp_port_open() {
+  local ip=$1 port=$2
+  python3 - "$ip" "$port" <<'PY'
+import socket
+import sys
+
+ip, port = sys.argv[1], int(sys.argv[2])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(2)
+try:
+    sock.connect((ip, port))
+except OSError:
+    sys.exit(1)
+finally:
+    sock.close()
+sys.exit(0)
+PY
+}
+
+warn_if_vm_port_closed() {
+  local proto=$1 ip=$2 port=$3
+  [[ "$proto" == tcp ]] || return 0
+  if ! vm_tcp_port_open "$ip" "$port"; then
+    warn "VM側 TCP ポート $ip:$port は Proxmox から見ると待受していなさそうです。ルール追加は続行します。"
+  fi
+}
+
+check_external_port_available() {
+  local proto=$1 ext=$2 conflict
+  if reserved_external_port "$ext" && [[ "${PVE_PORTFW_ALLOW_RESERVED:-0}" != 1 ]]; then
+    die "外側ポート $ext は Proxmox 本体用に予約しています。別のポートを選んでください"
+  fi
+  if rule_conflicts "$proto" "$ext" >/dev/null; then
+    die "外側 $proto ポート $ext はすでに pve-portfw に登録されています"
+  fi
+  if conflict=$(local_listener_for_port "$proto" "$ext"); then
+    die "外側 $proto ポート $ext は Proxmox 側サービスが使用中です: $conflict"
+  fi
+  if conflict=$(unmanaged_dnat_for_port "$proto" "$ext"); then
+    die "外側 $proto ポート $ext には管理外DNATルールがすでにあります: $conflict"
+  fi
+}
+
+make_rule_id() {
+  local max=0 rid
+  while IFS=$'\t' read -r rid _; do
+    [[ -z "${rid:-}" || "${rid:0:1}" == '#' ]] && continue
+    if [[ "$rid" =~ ^[0-9]+$ ]] && (( rid > max )); then
+      max=$rid
+    fi
+  done < "$RULES_FILE"
+  printf '%s' "$((max + 1))"
+}
+
+external_http_url() {
+  local port=$1 ext_ip
+  ext_ip=$(ext_if_ipv4)
+  [[ -n "$ext_ip" ]] || ext_ip="$EXT_IF"
+  printf 'http://%s:%s/' "$ext_ip" "$port"
+}
+
+add_rule_record() {
+  local vmid=$1 ext=$2 vmport=$3 proto=${4:-tcp} comment=${5:-} record name vmip rid url
+  valid_proto "$proto" || die "プロトコルは tcp または udp を指定してください"
+  valid_port "$ext" || die "外側ポートが正しくありません: $ext"
+  valid_port "$vmport" || die "VM側ポートが正しくありません: $vmport"
+  check_external_port_available "$proto" "$ext"
+  record=$(get_vm_record "$vmid") || die "ID $vmid は未登録です。pve-portfw register-vm $vmid <NAT-IP> を実行してください"
+  IFS=$'\t' read -r vmid name vmip <<< "$record"
+  valid_ipv4 "$vmip" || die "VM/CT ID $vmid の登録済み NAT IP が正しくありません: $vmip"
+  warn_if_vm_port_closed "$proto" "$vmip" "$vmport"
+  rid=$(make_rule_id)
+  comment=$(sanitize_field "$comment")
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rid" "$vmid" "$name" "$proto" "$ext" "$vmip" "$vmport" "$comment" >> "$RULES_FILE"
+  chmod 0644 "$RULES_FILE"
+  cmd_apply
+  log ""
+  log "ポート転送を設定しました:"
+  log "  ルールID: $rid"
+  log "  転送: ${EXT_IF}:$ext -> $vmip:$vmport/$proto ($name)"
+  if [[ "$proto" == tcp ]]; then
+    url=$(external_http_url "$ext")
+    log "  URL: $url"
+  fi
+}
+
+cmd_add() {
+  ensure_data
+  if (($# >= 3)); then
+    local vmid=$1 ext=$2 vmport=$3 proto=${4:-tcp}; shift $(( $# >= 4 ? 4 : 3 )) || true
+    local comment="$*"
+    add_rule_record "$vmid" "$ext" "$vmport" "$proto" "$comment"
+    return
+  fi
+  local row vmid name ip ext vmport comment
+  if ! row=$(choose_or_register_vm); then
+    return 0
+  fi
+  IFS=$'\t' read -r vmid name ip <<< "$row"
+  read -r -p 'Proxmox側の外側ポート: ' ext
+  valid_port "$ext" || die "外側ポートが正しくありません: $ext"
+  check_external_port_available tcp "$ext"
+  read -r -p 'VM/CT側のポート: ' vmport
+  read -r -p 'メモ（任意）: ' comment
+  add_rule_record "$vmid" "$ext" "$vmport" tcp "$comment"
+}
+
+cmd_list() {
+  ensure_data
+  refresh_guest_cache
+  title "VM/CT 台帳"
+  local vmid name ip status kind rid proto ext vmip vmport comment out dest
+  local -a rows
+  mapfile -t rows < <(
+    printf '種別\tID\t名前\tNAT IP\t状態\n'
+    while IFS=$'\t' read -r vmid name ip; do
+      status=OK
+      vm_exists "$vmid" || status=MISSING
+      kind=$(guest_kind "$vmid")
+      printf '%s\t%s\t%s\t%s\t%s\n' "$(ja_kind "$kind")" "$vmid" "$name" "$ip" "$(ja_status "$status")"
+    done < <(registered_vm_lines)
+  )
+  printf '%s\n' "${rows[@]}" | table
+  ((${#rows[@]} > 1)) || log "  （なし）"
+
+  log ""
+  title "ポート転送ルール"
+  mapfile -t rows < <(
+    printf 'ID\t通信\t外側\t転送先\tVM/CT\t名前\t状態\tメモ\n'
+    while IFS=$'\t' read -r rid vmid name proto ext vmip vmport comment; do
+      status=OK
+      vm_exists "$vmid" || status=MISSING
+      out="${EXT_IF}:$ext"
+      dest="${vmip}:$vmport"
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$rid" "$proto" "$out" "$dest" "$vmid" "$name" "$(ja_status "$status")" "${comment:-}"
+    done < <(rule_lines)
+  )
+  printf '%s\n' "${rows[@]}" | table
+  ((${#rows[@]} > 1)) || log "  （なし）"
+}
+
+cmd_ports() {
+  ensure_data
+  title "使用中の外側ポート"
+  local -a rows
+  mapfile -t rows < <(
+    printf '通信\tポート\t由来\t詳細\n'
+    {
+      local rid vmid name proto ext vmip vmport comment ext_ip
+      ext_ip=$(ext_if_ipv4)
+      while IFS=$'\t' read -r rid vmid name proto ext vmip vmport comment; do
+        printf '%s\t%s\t%s\t%s -> %s:%s (%s)\n' "$proto" "$ext" "pve-portfw" "${EXT_IF}:$ext" "$vmip" "$vmport" "$name"
+      done < <(rule_lines)
+
+      ss -H -lntp 2>/dev/null | awk -v ext="$ext_ip" '
+        function hostpart(value, tmp, port) {
+          if (value ~ /^\[.*\]:[0-9]+$/) {
+            tmp=value; sub(/^\[/, "", tmp); sub(/\]:[0-9]+$/, "", tmp); return tmp
+          }
+          n=split(value, parts, ":"); port=parts[n]; sub(":" port "$", "", value); return value
+        }
+        { host=hostpart($4); if (host == "*" || host == "0.0.0.0" || host == "::" || host == ext) print "tcp\t" $4 "\tProxmoxサービス\t" $0 }
+      '
+      ss -H -lnup 2>/dev/null | awk -v ext="$ext_ip" '
+        function hostpart(value, tmp, port) {
+          if (value ~ /^\[.*\]:[0-9]+$/) {
+            tmp=value; sub(/^\[/, "", tmp); sub(/\]:[0-9]+$/, "", tmp); return tmp
+          }
+          n=split(value, parts, ":"); port=parts[n]; sub(":" port "$", "", value); return value
+        }
+        { host=hostpart($4); if (host == "*" || host == "0.0.0.0" || host == "::" || host == ext) print "udp\t" $4 "\tProxmoxサービス\t" $0 }
+      '
+
+      iptables -t nat -S PREROUTING 2>/dev/null |
+        awk -v chain="$DNAT_CHAIN" '
+          $0 ~ /--dport/ && $0 !~ chain {
+            proto="-"; port="-";
+            for (i=1; i<=NF; i++) {
+              if ($i == "-p") proto=$(i+1);
+              if ($i == "--dport") port=$(i+1);
+            }
+            print proto "\t" port "\t管理外DNAT\t" $0
+          }
+        '
+    } | awk -F '\t' '
+      function portnum(value, parts) {
+        if (value ~ /^[0-9]+$/) return value
+        n = split(value, parts, ":")
+        return parts[n]
+      }
+      {
+        port = portnum($2)
+        if (port !~ /^[0-9]+$/) next
+        printf "%s\t%s\t%s\t%s\n", $1, port, $3, $4
+      }
+    ' | sort -k2,2n -k1,1
+  )
+  printf '%s\n' "${rows[@]}" | table
+  ((${#rows[@]} > 1)) || log "  （なし）"
+}
+
+cmd_apply() {
+  require_root
+  ensure_data
+  ensure_chains
+  ipt -t nat -F "$DNAT_CHAIN"
+  ipt -F "$FWD_CHAIN"
+
+  local rid vmid name proto ext vmip vmport comment count=0 skipped=0
+  while IFS=$'\t' read -r rid vmid name proto ext vmip vmport comment; do
+    if ! valid_proto "$proto" || ! valid_port "$ext" || ! valid_ipv4 "$vmip" || ! valid_port "$vmport"; then
+      warn "形式が壊れているルールをスキップします: ID=$rid"
+      skipped=$((skipped+1))
+      continue
+    fi
+    if ! vm_exists "$vmid"; then
+      warn "ルール ID=$rid をスキップします。VM/CT ID $vmid が存在しません"
+      skipped=$((skipped+1))
+      continue
+    fi
+    ipt -t nat -A "$DNAT_CHAIN" -p "$proto" --dport "$ext" -j DNAT --to-destination "$vmip:$vmport"
+    ipt -A "$FWD_CHAIN" -i "$EXT_IF" -o "$INT_IF" -p "$proto" -d "$vmip" --dport "$vmport" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+    ipt -A "$FWD_CHAIN" -i "$INT_IF" -o "$EXT_IF" -p "$proto" -s "$vmip" --sport "$vmport" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    count=$((count+1))
+  done < <(rule_lines)
+  log "反映しました: 有効 $count 件、スキップ $skipped 件"
+}
+
+cmd_flush() {
+  require_root
+  while ipt -t nat -C PREROUTING -i "$EXT_IF" -j "$DNAT_CHAIN" 2>/dev/null; do
+    ipt -t nat -D PREROUTING -i "$EXT_IF" -j "$DNAT_CHAIN"
+  done
+  while ipt -C FORWARD -j "$FWD_CHAIN" 2>/dev/null; do
+    ipt -D FORWARD -j "$FWD_CHAIN"
+  done
+  if ipt -t nat -L "$DNAT_CHAIN" >/dev/null 2>&1; then
+    ipt -t nat -F "$DNAT_CHAIN"
+    ipt -t nat -X "$DNAT_CHAIN" 2>/dev/null || true
+  fi
+  if ipt -L "$FWD_CHAIN" >/dev/null 2>&1; then
+    ipt -F "$FWD_CHAIN"
+    ipt -X "$FWD_CHAIN" 2>/dev/null || true
+  fi
+  log "pve-portfw 管理下の iptables チェーン/接続を削除しました"
+}
+
+cmd_delete() {
+  ensure_data
+  local target=${1:-} rows rid vmid name proto ext vmip vmport comment tmp i sel
+  mapfile -t rows < <(rule_lines)
+  ((${#rows[@]} > 0)) || die "ポート転送ルールはありません"
+  if [[ -z "$target" ]]; then
+    printf 'ポート転送ルール:\n'
+    {
+      printf '番号\tID\t通信\t外側\t転送先\t名前\tメモ\n'
+      for i in "${!rows[@]}"; do
+        IFS=$'\t' read -r rid vmid name proto ext vmip vmport comment <<< "${rows[$i]}"
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$((i+1))" "$rid" "$proto" "${EXT_IF}:$ext" "${vmip}:$vmport" "$name" "${comment:-}"
+      done
+    } | table
+    read -r -p '削除するルール番号: ' sel
+    [[ "$sel" =~ ^[0-9]+$ ]] || die "選択が正しくありません"
+    (( sel >= 1 && sel <= ${#rows[@]} )) || die "選択範囲外です"
+    IFS=$'\t' read -r target _ <<< "${rows[$((sel-1))]}"
+  fi
+  tmp=$(mktemp)
+  awk -F '\t' -v id="$target" 'BEGIN{OFS=FS} /^#/ || NF==0 {print; next} $1 != id {print}' "$RULES_FILE" > "$tmp"
+  if cmp -s "$tmp" "$RULES_FILE"; then
+    rm -f "$tmp"
+    die "ルールIDが見つかりません: $target"
+  fi
+  mv "$tmp" "$RULES_FILE"
+  chmod 0644 "$RULES_FILE"
+  log "ルールを削除しました: ID=$target"
+  cmd_apply
+}
+
+cmd_cleanup() {
+  ensure_data
+  local rows=() rid vmid name proto ext vmip vmport comment tmp missing=0 answer yes=${1:-}
+  while IFS=$'\t' read -r rid vmid name proto ext vmip vmport comment; do
+    if ! vm_exists "$vmid"; then
+      rows+=("$rid")
+      printf '削除済みVM/CTのルール: ルールID=%s VM/CT ID=%s 名前=%s 外側=%s:%s 転送先=%s:%s\n' "$rid" "$vmid" "$name" "$EXT_IF" "$ext" "$vmip" "$vmport"
+      missing=$((missing+1))
+    fi
+  done < <(rule_lines)
+  ((missing > 0)) || { log "削除済み VM/CT に紐づくルールはありません"; return; }
+  if [[ "$yes" != "--yes" && "$yes" != "-y" ]]; then
+    read -r -p "この $missing 件のルールを削除しますか？ [y/N]: " answer
+    [[ "$answer" == y || "$answer" == Y || "$answer" == yes || "$answer" == YES ]] || die "中止しました"
+  fi
+  tmp=$(mktemp)
+  awk -F '\t' -v ids=" ${rows[*]} " 'BEGIN{OFS=FS} /^#/ || NF==0 {print; next} index(ids, " "$1" ") == 0 {print}' "$RULES_FILE" > "$tmp"
+  mv "$tmp" "$RULES_FILE"
+  chmod 0644 "$RULES_FILE"
+  cmd_apply
+}
+
+registry_id_has_rule() {
+  local target=$1 rid vmid name proto ext vmip vmport comment
+  while IFS=$'\t' read -r rid vmid name proto ext vmip vmport comment; do
+    [[ "$vmid" == "$target" ]] && return 0
+  done < <(rule_lines)
+  return 1
+}
+
+prune_missing_registry() {
+  ensure_data
+  refresh_guest_cache
+  local mode=${1:-normal} tmp line id name ip extra removed=0 kept=0
+  tmp=$(mktemp)
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if [[ -z "$line" || "${line:0:1}" == '#' ]]; then
+      printf '%s\n' "$line" >> "$tmp"
+      continue
+    fi
+    IFS=$'\t' read -r id name ip extra <<< "$line"
+    if vm_exists "$id"; then
+      printf '%s\n' "$line" >> "$tmp"
+      continue
+    fi
+    if registry_id_has_rule "$id"; then
+      printf '%s\n' "$line" >> "$tmp"
+      kept=$((kept + 1))
+      [[ "$mode" == quiet ]] || warn "削除済み ID=$id ($name) の台帳行は残します。転送ルールがまだ存在します"
+      continue
+    fi
+    removed=$((removed + 1))
+    [[ "$mode" == quiet ]] || log "古い台帳行を削除しました: ID=$id 名前=$name IP=$ip"
+  done < "$VMS_FILE"
+
+  if cmp -s "$tmp" "$VMS_FILE"; then
+    rm -f "$tmp"
+  else
+    mv "$tmp" "$VMS_FILE"
+    chmod 0644 "$VMS_FILE"
+  fi
+
+  if [[ "$mode" != quiet && "$removed" == 0 && "$kept" == 0 ]]; then
+    log "削除できる古い台帳行はありません"
+  fi
+}
+
+cmd_scan() {
+  ensure_data
+  printf '%s を %s 上でスキャンしています...\n' "$NAT_CIDR" "$INT_IF" >&2
+  probe_nat_network
+
+  title "NAT IP 検出結果"
+
+  local rows=() scan_rows=() kind id name status bridges macs detected registered reg_id reg_name reg_ip state record found=0
+  scan_rows+=("種別"$'\t'"ID"$'\t'"名前"$'\t'"MAC"$'\t'"検出IP"$'\t'"登録IP"$'\t'"状態")
+  mapfile -t rows < <(
+    qm list 2>/dev/null | awk 'NR>1 {printf "vm\t%s\t%s\t%s\n", $1, $2, $3}'
+    pct list 2>/dev/null | awk 'NR>1 {printf "ct\t%s\t%s\t%s\n", $1, $NF, $2}'
+  )
+  for row in "${rows[@]}"; do
+    IFS=$'\t' read -r kind id name status <<< "$row"
+    bridges=$(vm_bridges_from_qm "$id")
+    [[ ",$bridges," == *",$INT_IF,"* ]] || continue
+    detected=$(detected_ips_for_id "$id")
+    macs=$(guest_macs_from_config "$id" | paste -sd, -)
+    registered="-"
+    state="UNREGISTERED"
+    if record=$(get_vm_record "$id" 2>/dev/null); then
+      IFS=$'\t' read -r reg_id reg_name reg_ip <<< "$record"
+      registered="$reg_ip"
+      if [[ -z "$detected" ]]; then
+        state="NO-IP"
+      elif [[ ",$detected," == *",$registered,"* ]]; then
+        state="OK"
+      else
+        state="MISMATCH"
+      fi
+    elif [[ -n "$detected" ]]; then
+      state="DETECTED"
+    elif [[ "$status" != "running" ]]; then
+      state="STOPPED"
+    fi
+    scan_rows+=("$(ja_kind "$kind")"$'\t'"$id"$'\t'"$name"$'\t'"${macs:-"-"}"$'\t'"${detected:-"-"}"$'\t'"$registered"$'\t'"$(ja_status "$state")")
+    found=1
+  done
+  printf '%s\n' "${scan_rows[@]}" | table
+  ((found)) || log "  （$INT_IF に接続された VM/CT はありません）"
+}
+
+cmd_sync() {
+  ensure_data
+  auto_register_detected normal
+  log ""
+  cmd_list
+}
+
+cmd_refresh() {
+  ensure_data
+  local mode=normal
+  [[ "${1:-}" == "--quiet" || "${1:-}" == "-q" ]] && mode=quiet
+  auto_register_detected "$mode"
+  prune_missing_registry "$mode"
+  [[ "$mode" == quiet ]] || { log ""; cmd_list; }
+}
+
+cmd_doctor() {
+  ensure_data
+  log "ネットワークインターフェース:"
+  ip -br addr show "$EXT_IF" || true
+  ip -br addr show "$INT_IF" || true
+  log ""
+  log "IP転送:"
+  sysctl net.ipv4.ip_forward || true
+  log ""
+  log "外向きNATの確認:"
+  if ipt -t nat -C POSTROUTING -s "$NAT_CIDR" -o "$EXT_IF" -j MASQUERADE 2>/dev/null; then
+    log "  正常: MASQUERADE $NAT_CIDR -> $EXT_IF"
+  else
+    warn "MASQUERADE が見つかりません: $NAT_CIDR -> $EXT_IF"
+  fi
+  log ""
+  log "pve-portfw のチェーン/接続:"
+  if ipt -t nat -L "$DNAT_CHAIN" -n >/dev/null 2>&1; then
+    log "  正常: nat/$DNAT_CHAIN があります"
+  else
+    warn "nat/$DNAT_CHAIN がありません。pve-portfw apply を実行してください"
+  fi
+  if ipt -L "$FWD_CHAIN" -n >/dev/null 2>&1; then
+    log "  正常: filter/$FWD_CHAIN があります"
+  else
+    warn "filter/$FWD_CHAIN がありません。pve-portfw apply を実行してください"
+  fi
+  log ""
+  cmd_list
+  log ""
+  cmd_ports
+  log ""
+  cmd_scan
+  log ""
+  log "管理外DNAT候補:"
+  local unmanaged
+  unmanaged=$(iptables -t nat -S PREROUTING | grep DNAT | grep -v "$DNAT_CHAIN" || true)
+  if [[ -n "$unmanaged" ]]; then
+    printf '%s\n' "$unmanaged"
+  else
+    log "  （なし）"
+  fi
+}
+
+cmd_manage() {
+  ensure_data
+  while true; do
+    cat <<EOF
+
+pve-portfw menu
+  1) 台帳とルールを表示
+  2) VM/CT 台帳を更新
+  3) VM/CT の NAT IP を手動登録
+  4) ポート転送ルールを追加
+  5) ポート転送ルールを削除
+  6) 使用中の外側ポートを表示
+  7) ルールを iptables に反映
+  8) 削除済み VM/CT のルールを掃除
+  9) NAT IP をスキャン
+  c) 設定チェック
+  f) 管理下 iptables ルールを削除
+  h) ヘルプ
+  0) 終了
+EOF
+    local choice
+    read -r -p '選択: ' choice
+    case "$choice" in
+      1) cmd_list ;;
+      2) cmd_refresh ;;
+      3) cmd_register_vm ;;
+      4) cmd_add ;;
+      5) cmd_delete ;;
+      6) cmd_ports ;;
+      7) cmd_apply ;;
+      8) cmd_cleanup ;;
+      9) cmd_scan ;;
+      c|C) cmd_doctor ;;
+      f|F) cmd_flush ;;
+      h|H|help|\?) cmd_help ;;
+      0|q|quit|exit) break ;;
+      *) warn "選択肢がわかりません" ;;
+    esac
+  done
+}
+
+cmd_menu() {
+  cmd_add "$@"
+}
+
+main() {
+  require_root
+  local cmd=${1:-menu}
+  [[ $# -gt 0 ]] && shift || true
+  case "$cmd" in
+    menu) cmd_menu "$@" ;;
+    manage|admin) cmd_manage "$@" ;;
+    register-vm|register) cmd_register_vm "$@" ;;
+    sync|auto-register|autoregister) cmd_sync "$@" ;;
+    refresh) cmd_refresh "$@" ;;
+    add) cmd_add "$@" ;;
+    ports|used-ports) cmd_ports "$@" ;;
+    list|ls) cmd_list "$@" ;;
+    delete|del|rm) cmd_delete "$@" ;;
+    apply|reload) cmd_apply "$@" ;;
+    flush) cmd_flush "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    scan) cmd_scan "$@" ;;
+    doctor|check) cmd_doctor "$@" ;;
+    help|-h|--help) cmd_help ;;
+    *) usage; die "不明なコマンドです: $cmd" ;;
+  esac
+}
+
+main "$@"
