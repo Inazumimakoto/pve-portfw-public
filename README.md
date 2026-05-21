@@ -38,6 +38,26 @@ VMを作るたびに、iptablesのポート転送設定を手で書くのが大�
 - NATや転送設定の診断
 - Web画面での状態確認とヘルプ表示
 
+## スクリーンショット
+
+### ヘルプWeb
+
+![ヘルプWebのトップ画面](docs/assets/home.png)
+
+### 管理ダッシュボード
+
+![管理ダッシュボード](docs/assets/dashboard.png)
+
+### 通信設定ページ
+
+![通信設定ページ](docs/assets/network.png)
+
+## デモ動画
+
+NAT内VMでnginxを起動し、ポート転送ルールを追加することで研究室LAN側からWebページへ到達できる様子を録画しました。
+
+[デモ動画を見る](docs/assets/pve-portfw-demo.mp4)
+
 ## 工夫した点
 
 - iptablesを直接手で管理せず、台帳ファイルをもとに反映する設計にした
