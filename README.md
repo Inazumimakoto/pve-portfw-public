@@ -76,7 +76,7 @@ Web側は読み取り専用で、実際の登録・追加・削除は `pve-portf
 
 NAT内VMでnginxを起動し、ポート転送ルールを追加することで研究室LAN側からWebページへ到達できる様子を録画しました。
 
-[デモ動画を見る](docs/assets/pve-portfw-demo.mp4)
+[デモ動画を見る](https://youtu.be/yDUCDBZI32E)
 
 ## 工夫した点
 
