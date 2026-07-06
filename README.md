@@ -5,6 +5,10 @@
 NAT内に置いたVMへ、研究室LANから必要なポートだけアクセスできるようにします。
 CLIとWeb画面から、VMのIPアドレス、使用中ポート、転送ルールを確認・管理できます。
 
+## 動作デモ
+
+![pve-portfwの動作デモ](docs/assets/pve-portfw-demo.gif)
+
 ## 何をするツールか
 
 通常、NAT内のVMは外部PCから直接アクセスできません。
@@ -77,8 +81,6 @@ Web側は読み取り専用で、実際の登録・追加・削除は `pve-portf
 NAT内VMでnginxを起動し、ポート転送ルールを追加することで研究室LAN側からWebページへ到達できる様子を録画しました。
 
 [デモ動画を見る](https://youtu.be/yDUCDBZI32E)
-<img width="720" height="405" alt="pve-portfw-demo" src="https://github.com/user-attachments/assets/191ce131-42bd-4f3c-818e-2407f7a5438a" />
-
 
 ## 工夫した点
 
